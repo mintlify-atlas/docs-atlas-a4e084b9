@@ -1,0 +1,147 @@
+---
+title: Installation
+description: Install angrop and get ready to build ROP chains
+---
+
+# Installing angrop
+
+angrop is distributed as a Python package and can be installed via pip. It requires Python 3.6 or higher.
+
+## Requirements
+
+<Info>
+  **Python Version**: angrop requires Python >= 3.6
+</Info>
+
+angrop has two main dependencies:
+
+- **angr** - The symbolic execution engine that powers angrop
+- **tqdm** - For progress bars during gadget finding
+
+These dependencies will be installed automatically when you install angrop.
+
+## Installation Steps
+
+<Steps>
+  <Step title="Ensure Python 3.6+">
+    Verify you have Python 3.6 or higher installed:
+    
+    ```bash
+    python --version
+    # or
+    python3 --version
+    ```
+    
+    You should see Python 3.6.0 or higher.
+  </Step>
+  
+  <Step title="Install angrop via pip">
+    Install angrop using pip:
+    
+    ```bash
+    pip install angrop
+    ```
+    
+    This will install angrop along with all required dependencies including angr and tqdm.
+  </Step>
+  
+  <Step title="Verify installation">
+    Verify the installation by checking the CLI tool:
+    
+    ```bash
+    angrop-cli --help
+    ```
+    
+    And verify the Python API:
+    
+    ```python
+    python -c "import angr, angrop; print('angrop version:', angrop.__version__)"
+    ```
+  </Step>
+</Steps>
+
+## Alternative Installation Methods
+
+### From Source
+
+If you want to install from source or contribute to development:
+
+```bash
+git clone https://github.com/angr/angrop.git
+cd angrop
+pip install -e .
+```
+
+This installs angrop in editable mode, so changes to the source code are immediately reflected.
+
+### Using Docker
+
+angrop includes a Dockerfile for containerized usage:
+
+```bash
+git clone https://github.com/angr/angrop.git
+cd angrop
+docker build -t angrop .
+docker run -it angrop
+```
+
+## Troubleshooting
+
+<AccordionGroup>
+  <Accordion title="angr installation fails">
+    angr has some complex dependencies. If you encounter issues:
+    
+    1. Ensure you have a working C compiler installed
+    2. Try installing in a fresh virtual environment:
+       ```bash
+       python -m venv angrop-env
+       source angrop-env/bin/activate  # On Windows: angrop-env\Scripts\activate
+       pip install angrop
+       ```
+    3. Check the [angr installation documentation](https://docs.angr.io/introductory-errata/install) for platform-specific issues
+  </Accordion>
+  
+  <Accordion title="Command not found: angrop-cli">
+    If `angrop-cli` is not found after installation:
+    
+    1. Ensure pip's bin directory is in your PATH
+    2. Try running with `python -m angrop.angrop_cli` instead
+    3. Check if it's installed with: `pip show angrop`
+  </Accordion>
+  
+  <Accordion title="Import errors in Python">
+    If you get import errors:
+    
+    ```python
+    import sys
+    print(sys.version)  # Verify Python version >= 3.6
+    print(sys.path)     # Check if angrop is in the path
+    ```
+    
+    Make sure you're using the same Python environment where you installed angrop.
+  </Accordion>
+</AccordionGroup>
+
+## Updating angrop
+
+To update to the latest version:
+
+```bash
+pip install --upgrade angrop
+```
+
+## Uninstalling
+
+To remove angrop:
+
+```bash
+pip uninstall angrop
+```
+
+<Note>
+  This won't remove angr and other dependencies. To remove those as well, uninstall them separately or delete the virtual environment.
+</Note>
+
+## Next Steps
+
+Now that you have angrop installed, head over to the [Quickstart](/quickstart) guide to build your first ROP chain!

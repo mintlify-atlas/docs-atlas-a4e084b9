@@ -1,0 +1,538 @@
+---
+title: Shifter
+description: Stack shifting chain builder for adjusting stack pointer by specific amounts
+---
+
+The `Shifter` class builds ROP chains that shift the stack pointer by specific byte amounts, enabling precise stack manipulation and ret-sled construction.
+
+## Overview
+
+Accessed through the ROP instance as `rop.shift()` and `rop.retsled()`, Shifter automatically:
+- Finds pop chains that shift SP by exact amounts
+- Constructs ret-sleds of arbitrary length
+- Manages stack value placement
+- Supports custom next PC positioning
+- Verifies stack shifts
+
+## Class Definition
+
+```python
+class Shifter(Builder)
+```
+
+Located in `angrop/chain_builder/shifter.py`
+
+## Public Methods
+
+### shift
+
+```python
+shift(length, preserve_regs=None, next_pc_idx=-1) -> RopChain
+```
+
+Builds a chain that shifts the stack pointer by a specific number of bytes.
+
+<ParamField path="length" type="int" required>
+  Number of bytes to shift the stack (must be word-aligned).
+</ParamField>
+
+<ParamField path="preserve_regs" type="set | None" default="None">
+  Set of register names that should not be modified.
+</ParamField>
+
+<ParamField path="next_pc_idx" type="int" default="-1">
+  Index (in words) where the next PC should be placed. Supports negative indexing.
+  - `-1`: Next PC at end (default)
+  - `0`: Next PC at start
+  - Positive: Absolute position
+</ParamField>
+
+**Returns:** A `RopChain` that shifts the stack.
+
+**Raises:** `RopException` if shift cannot be performed.
+
+### retsled
+
+```python
+retsled(size, preserve_regs=None) -> RopChain
+```
+
+Builds a ret-sled of specified size (chain of ret gadgets).
+
+<ParamField path="size" type="int" required>
+  Total size in bytes for the ret-sled (must be word-aligned).
+</ParamField>
+
+<ParamField path="preserve_regs" type="set | None" default="None">
+  Set of register names that should not be modified.
+</ParamField>
+
+**Returns:** A `RopChain` consisting only of ret gadgets.
+
+**Raises:** `RopException` if ret-sled cannot be built.
+
+### verify_shift
+
+```python
+verify_shift(chain, length, preserve_regs) -> bool
+```
+
+Verifies that a chain correctly shifts the stack.
+
+<ParamField path="chain" type="RopChain" required>
+  Chain to verify.
+</ParamField>
+
+<ParamField path="length" type="int" required>
+  Expected shift amount.
+</ParamField>
+
+<ParamField path="preserve_regs" type="set" required>
+  Registers that should not be modified.
+</ParamField>
+
+**Returns:** True if verification passes, False otherwise.
+
+### verify_retsled
+
+```python
+verify_retsled(chain, size, preserve_regs) -> bool
+```
+
+Verifies that a ret-sled has the correct size.
+
+<ParamField path="chain" type="RopChain" required>
+  Chain to verify.
+</ParamField>
+
+<ParamField path="size" type="int" required>
+  Expected size in bytes.
+</ParamField>
+
+<ParamField path="preserve_regs" type="set" required>
+  Registers that should not be modified.
+</ParamField>
+
+**Returns:** True if verification passes, False otherwise.
+
+## ROP Instance Methods
+
+```python
+rop.shift(length, preserve_regs=None, next_pc_idx=-1)
+rop.retsled(size, preserve_regs=None)
+```
+
+## Implementation Details
+
+### Shift Gadget Dictionary
+
+Shifter maintains a dictionary mapping stack changes to gadgets:
+
+From source code (shifter.py:140-159):
+
+```python
+def filter_gadgets(self, gadgets):
+    # Only self-contained gadgets with no memory access
+    gadgets = [
+        x for x in gadgets
+        if x.num_sym_mem_access == 0 and x.self_contained
+    ]
+    
+    gadgets = self._filter_gadgets(gadgets)
+    
+    # Group by stack_change
+    d = defaultdict(list)
+    for g in gadgets:
+        d[g.stack_change].append(g)
+    
+    # Sort each group by number of changed registers
+    for x in d:
+        d[x] = sorted(d[x], key=lambda g: len(g.changed_regs))
+    
+    return d
+```
+
+Example dictionary:
+```python
+{
+    8: [pop rax; ret, pop rbx; ret, ...],
+    16: [pop rax; pop rbx; ret, pop rdi; pop rsi; ret, ...],
+    24: [pop rax; pop rbx; pop rcx; ret, ...],
+    ...
+}
+```
+
+### Shift Implementation
+
+From source code (shifter.py:62-110):
+
+```python
+def shift(self, length, preserve_regs=None, next_pc_idx=-1):
+    preserve_regs = set(preserve_regs) if preserve_regs else set()
+    arch_bytes = self.project.arch.bytes
+    
+    # Validate alignment
+    if length % arch_bytes != 0:
+        raise RopException("Cannot shift misaligned sp change")
+    
+    # Find gadget with exact stack change
+    if length not in self.shift_gadgets or \
+       all(preserve_regs.intersection(x.changed_regs) 
+           for x in self.shift_gadgets[length]):
+        raise RopException("Cannot find suitable shift gadget")
+    
+    # Calculate word count and normalize index
+    g_cnt = length // arch_bytes
+    next_pc_idx = (next_pc_idx % g_cnt + g_cnt) % g_cnt
+    
+    # Find compatible gadget
+    for g in self.shift_gadgets[length]:
+        if preserve_regs.intersection(g.changed_regs):
+            continue
+        if g.transit_type != 'pop_pc':
+            continue
+        if g.pc_offset != next_pc_idx * arch_bytes:
+            continue
+        
+        # Build chain with symbolic stack values
+        chain = RopBlock(self.project, self)
+        state = chain._blank_state
+        chain.add_gadget(g)
+        
+        for idx in range(g_cnt):
+            if idx != next_pc_idx:
+                # Symbolic stack value
+                tmp = claripy.BVS(f"symbolic_stack_{idx}", arch_bits)
+                chain.add_value(tmp)
+            else:
+                # Next PC value
+                next_pc_val = rop_utils.cast_rop_value(
+                    claripy.BVS("next_pc", arch_bits),
+                    self.project
+                )
+                chain.add_value(next_pc_val)
+        
+        if self.verify_shift(chain, length, preserve_regs):
+            return chain
+```
+
+### Retsled Implementation
+
+From source code (shifter.py:112-130):
+
+```python
+def retsled(self, size, preserve_regs=None):
+    preserve_regs = set(preserve_regs) if preserve_regs else set()
+    arch_bytes = self.project.arch.bytes
+    
+    if size % arch_bytes != 0:
+        raise RopException("retsled size must be word aligned")
+    
+    if not self.shift_gadgets[arch_bytes]:
+        raise RopException("Cannot find ret-equivalent gadget")
+    
+    # Use minimal ret gadget
+    for g in self.shift_gadgets[arch_bytes]:
+        chain = RopChain(self.project, self.chain_builder)
+        for _ in range(size // arch_bytes):
+            chain.add_gadget(g)
+        
+        if self.verify_retsled(chain, size, preserve_regs):
+            return chain
+```
+
+## Usage Examples
+
+### Basic Stack Shift
+
+```python
+import angr
+import angrop
+
+proj = angr.Project("/bin/bash")
+rop = proj.analyses.ROP()
+rop.find_gadgets()
+
+# Shift stack by 32 bytes
+chain = rop.shift(32)
+chain.pp()
+```
+
+Output:
+```
+0x0000000000410b23: pop rax; pop rbx; pop rcx; pop rdx; ret
+                    <symbolic>
+                    <symbolic>
+                    <symbolic>
+                    <symbolic>
+```
+
+### Shift with Custom Next PC Position
+
+```python
+# Next PC at the beginning (index 0)
+chain = rop.shift(32, next_pc_idx=0)
+
+# Next PC at position 2 (third word)
+chain = rop.shift(32, next_pc_idx=2)
+
+# Next PC at the end (default)
+chain = rop.shift(32, next_pc_idx=-1)
+```
+
+### Stack Arguments for Function Calls
+
+Used internally by FuncCaller for stack arguments:
+
+From source code context:
+
+```python
+# Function with stack arguments
+if stack_arguments:
+    shift_bytes = (len(stack_arguments) + 1) * arch_bytes
+    cleaner = rop.shift(shift_bytes, next_pc_idx=-1, 
+                       preserve_regs=preserve_regs)
+    chain.add_gadget(cleaner._gadgets[0])
+    for arg in stack_arguments:
+        chain.add_value(arg)
+    chain.add_value(next_pc)
+```
+
+### Ret-Sled
+
+```python
+# Create 64-byte ret-sled
+chain = rop.retsled(64)
+chain.pp()
+```
+
+Output:
+```
+0x0000000000400123: ret
+0x0000000000400123: ret
+0x0000000000400123: ret
+0x0000000000400123: ret
+0x0000000000400123: ret
+0x0000000000400123: ret
+0x0000000000400123: ret
+0x0000000000400123: ret
+```
+
+### NOP Sled Equivalent
+
+```python
+# Ret-sled as timing/alignment mechanism
+alignment_sled = rop.retsled(24)
+main_chain = rop.set_regs(rax=0x1337)
+full_chain = alignment_sled + main_chain
+```
+
+### Preserving Registers During Shift
+
+```python
+# Don't clobber rax during shift
+chain = rop.shift(32, preserve_regs={'rax'})
+```
+
+### Stack Cleanup After Function
+
+```python
+# Call function with 5 stack args
+# Then clean up stack
+chain = rop.func_call("big_func", [1, 2, 3, 4, 5, 6, 7])
+chain += rop.shift(40)  # Clean up 5 args (5 * 8 bytes)
+```
+
+## Shift Gadget Patterns
+
+### Common Patterns by Stack Change
+
+#### 8 bytes (1 word)
+```asm
+ret                    ; Minimal shift
+pop rax; ret          ; Shift with pop
+```
+
+#### 16 bytes (2 words)
+```asm
+pop rax; pop rbx; ret
+pop rdi; pop rsi; ret
+```
+
+#### 24 bytes (3 words)
+```asm
+pop rax; pop rbx; pop rcx; ret
+pop rdi; pop rsi; pop rdx; ret
+```
+
+#### 32 bytes (4 words)
+```asm
+pop rax; pop rbx; pop rcx; pop rdx; ret
+pop rdi; pop rsi; pop rdx; pop rcx; ret
+```
+
+### PC Offset Importance
+
+The `pc_offset` determines where ret pops from:
+
+```asm
+; pop rax; pop rbx; ret
+; pc_offset = 16 (2 * 8 bytes)
+; Stack: [rax][rbx][ret_addr]
+;         0    8    16 <- PC here
+
+; For next_pc_idx=0:
+; Stack: [ret_addr][rax][rbx]
+;         0 <- PC here
+```
+
+## Verification
+
+From source code (shifter.py:26-42):
+
+```python
+def verify_shift(self, chain, length, preserve_regs):
+    arch_bytes = self.project.arch.bytes
+    init_sp = chain._blank_state.regs.sp.concrete_value
+    state = chain.exec()
+    
+    # Check SP shifted correctly (+arch_bytes for ret)
+    if state.regs.sp.concrete_value != init_sp + length + arch_bytes:
+        return False
+    
+    # Check preserved registers
+    for act in state.history.actions:
+        if act.type != 'reg' or act.action != 'write':
+            continue
+        offset = act.offset
+        offset -= act.offset % arch_bytes
+        reg_name = arch.translate_register_name(offset)
+        if reg_name in preserve_regs:
+            return False
+    
+    return True
+```
+
+## Effect and Comparison Tuples
+
+From source code (shifter.py:132-138):
+
+```python
+def _effect_tuple(self, g):
+    v1 = g.stack_change
+    v2 = g.pc_offset
+    return (v1, v2)
+
+def _comparison_tuple(self, g):
+    return (len(g.changed_regs), g.stack_change, 
+            rop_utils.transit_num(g), g.isn_count)
+```
+
+This ensures:
+1. Gadgets grouped by stack_change and pc_offset
+2. Within groups, prefer fewer register changes
+3. Then prefer smaller stack changes
+4. Then simpler transit types
+5. Finally fewer instructions
+
+## Error Handling
+
+### "Currently, we do not support shifting misaligned sp change"
+
+Raised when length is not word-aligned.
+
+**Solution:** Use multiples of word size:
+```python
+# x64: multiples of 8
+chain = rop.shift(8)   # OK
+chain = rop.shift(16)  # OK
+chain = rop.shift(12)  # ERROR
+
+# x86: multiples of 4
+chain = rop.shift(4)   # OK
+chain = rop.shift(7)   # ERROR
+```
+
+### "Encounter a shifting request that requires chaining multiple shifting gadgets"
+
+Raised when exact shift amount isn't available.
+
+**Solutions:**
+1. Try a different shift amount
+2. Use `fast_mode=False` for more gadgets
+3. Manually chain multiple shifts:
+   ```python
+   chain = rop.shift(32)
+   chain += rop.shift(16)  # Total: 48 bytes
+   ```
+
+### "the size of a retsled must be word aligned"
+
+Raised when retsled size is not aligned.
+
+**Solution:** Use word-aligned sizes.
+
+### "fail to find a ret-equivalent gadget"
+
+Raised when no simple ret gadget exists.
+
+**Solution:** Very rare; binary likely has unusual structure.
+
+## Performance Considerations
+
+- Gadget dictionary is pre-built during bootstrap
+- Shifts are fast (single gadget)
+- Retsleds may be long but simple
+- Verification adds small overhead
+
+## Architecture Support
+
+- **x86/x86_64**: Full support, many pop patterns
+- **ARM/ARM64**: Full support
+- **MIPS**: Full support
+- **PowerPC**: Basic support
+
+## Advanced Techniques
+
+### Precise Stack Control
+
+```python
+# Need exactly 48 bytes of stack space
+chain = rop.shift(48)
+
+# Or combine shifts
+chain = rop.shift(32)
+chain += rop.shift(16)
+```
+
+### Custom Stack Layouts
+
+```python
+# Place next PC at specific position
+# For custom stack frame layouts
+chain = rop.shift(40, next_pc_idx=3)
+# Stack: [val][val][val][next_pc][val]
+```
+
+### Ret-Sled for Alignment
+
+```python
+# Ensure 16-byte alignment
+if (current_offset % 16) != 0:
+    padding = 16 - (current_offset % 16)
+    chain += rop.retsled(padding)
+```
+
+## Best Practices
+
+1. **Use for exact amounts**: When you need precise stack shifts
+2. **Prefer simpler shifts**: Fewer words = fewer clobbered registers
+3. **Check alignment**: Always use word-aligned values
+4. **Verify shifts**: Use `chain.pp()` to inspect
+5. **Consider alternatives**: Sometimes `pivot()` is better
+
+## See Also
+
+- [Pivot](/api/pivot) - Stack pivoting to arbitrary locations
+- [FuncCaller](/api/func-caller) - Uses shift for stack arguments
+- [ChainBuilder](/api/chain-builder) - Main chain building interface

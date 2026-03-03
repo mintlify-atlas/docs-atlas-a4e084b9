@@ -1,0 +1,380 @@
+---
+title: MemWriter
+description: Memory writing chain builder for writing arbitrary data to memory
+---
+
+The `MemWriter` class builds ROP chains that write arbitrary data to memory addresses. It handles badbytes, chunk optimization, and uses memory arithmetic operations when needed.
+
+## Overview
+
+Accessed through the ROP instance as `rop.write_to_mem()`, MemWriter automatically:
+- Finds optimal memory write gadgets
+- Handles data with badbytes using arithmetic transformations
+- Writes data in efficient chunks (1, 2, 4, or 8 bytes)
+- Manages address and data register dependencies
+
+## Class Definition
+
+```python
+class MemWriter(Builder)
+```
+
+Located in `angrop/chain_builder/mem_writer.py`
+
+## Public Method
+
+### write_to_mem
+
+```python
+write_to_mem(addr, data, preserve_regs=None, fill_byte=b"\xff") -> RopChain
+```
+
+Builds a ROP chain that writes data to a memory address.
+
+<ParamField path="addr" type="int | RopValue" required>
+  Target memory address where data will be written.
+</ParamField>
+
+<ParamField path="data" type="bytes" required>
+  Data to write (must be a bytes object).
+</ParamField>
+
+<ParamField path="preserve_regs" type="set | None" default="None">
+  Set of register names that must not be modified.
+</ParamField>
+
+<ParamField path="fill_byte" type="bytes" default="b'\xff'">
+  Single byte used to pad data if necessary. Must not be a badbyte.
+</ParamField>
+
+**Returns:** A `RopChain` that writes the data to memory.
+
+**Raises:** 
+- `RopException` if data cannot be written
+- `RopException` if fill_byte is a badbyte
+- `RopException` if addr is symbolic
+
+## ROP Instance Method
+
+When you call `rop.write_to_mem()`, it invokes `MemWriter.write_to_mem()` internally:
+
+```python
+rop.write_to_mem(addr, data, preserve_regs=None, fill_byte=b"\xff")
+```
+
+## Implementation Details
+
+### Memory Write Gadgets
+
+MemWriter requires gadgets with specific properties:
+
+1. **Self-contained**: No dependencies on initial state
+2. **Single memory write**: Only one symbolic write operation
+3. **Independent addr/data**: Address and data controlled by different registers
+
+From source code (mem_writer.py:358-375):
+
+```python
+def _get_all_mem_write_gadgets(gadgets):
+    possible_gadgets = set()
+    for g in gadgets:
+        if not g.self_contained:
+            continue
+        if len(g.mem_writes) != 1:
+            continue
+        for m_access in g.mem_writes:
+            if (m_access.addr_controllable() and 
+                m_access.data_controllable() and 
+                m_access.addr_data_independent()):
+                possible_gadgets.add(g)
+    return possible_gadgets
+```
+
+### Gadget Examples
+
+```asm
+; Good memory write gadgets
+mov [rax], rbx; ret          ; addr=rax, data=rbx, independent
+mov qword ptr [rdi], rsi; ret
+mov dword ptr [rcx], edx; ret
+
+; Bad gadgets
+mov [rax], rax; ret          ; addr and data not independent
+mov [rax], 0x42; ret         ; data not controllable
+```
+
+### Badbyte Handling
+
+When data contains badbytes, MemWriter uses multiple strategies:
+
+#### 1. Chunk Transforms
+
+Transforms safe bytes into target bytes using arithmetic:
+
+From source code (mem_writer.py:213-250):
+
+```python
+def _find_chunk_transforms(target_bytes, badbytes, preferred_init):
+    ops = ("xor", "or", "and", "add")
+    for op in ops:
+        init_bytes = []
+        arg_bytes = []
+        for tb in target_bytes:
+            solved = _solve_byte_pair(tb, op, badbytes, preferred_init)
+            if solved is None:
+                break
+            ib, ab = solved
+            init_bytes.append(ib)
+            arg_bytes.append(ab)
+        
+        if found:
+            # Write init_bytes, then apply op with arg
+            yield (init_blob, op, arg_val)
+```
+
+Example:
+```python
+# To write 0x0a (badbyte):
+# Method 1: Write 0x0b, then subtract 1
+# Method 2: Write 0x00, then OR 0x0a (if 0x00 is safe)
+# Method 3: Write 0xff, then AND 0x0a
+```
+
+#### 2. Per-Byte Operations
+
+Handles each byte with different operations:
+
+```python
+# Byte 0: XOR 0x41 with 0x4b -> 0x0a
+# Byte 1: ADD 0x00 with 0x20 -> 0x20
+# Byte 2: OR  0x00 with 0xff -> 0xff
+```
+
+#### 3. Write Plans
+
+From source code (mem_writer.py:607-629):
+
+```python
+def _badbyte_mem_write_plans(data_size):
+    """Generate plans using different chunk sizes"""
+    chunk_sizes = (1, 2, 4, 8)
+    
+    def dfs(plans, total):
+        if total >= data_size:
+            yield (total, list(plans))
+            return
+        for cz in chunk_sizes:
+            plans.append((total, cz))
+            yield from dfs(plans, total+cz)
+            plans.pop()
+```
+
+### MemWriteChain Caching
+
+MemWriter caches chain templates for efficiency:
+
+From source code (mem_writer.py:18-132):
+
+```python
+class MemWriteChain:
+    """Cached memory writing chain template"""
+    
+    def __init__(self, builder, gadget, preserve_regs):
+        # Build template with symbolic addr/data
+        self.addr_bv = claripy.BVS("addr", mem_write.addr_size)
+        self.data_bv = claripy.BVS("data", mem_write.data_size)
+        self.chain = self._build_chain()
+    
+    def concretize(self, addr_val, data):
+        # Replace symbolic values with concrete ones
+        chain = self.chain.copy()
+        # ... replace addr_bv and data_bv ...
+        return chain
+```
+
+## Usage Examples
+
+### Basic Memory Write
+
+```python
+import angr
+import angrop
+
+proj = angr.Project("/bin/bash")
+rop = proj.analyses.ROP()
+rop.find_gadgets()
+
+# Write string to memory
+chain = rop.write_to_mem(0x61b100, b"/bin/sh\x00")
+chain.pp()
+```
+
+### Writing Binary Data
+
+```python
+# Write shellcode
+shellcode = b"\x31\xc0\x48\xbb\xd1\x9d\x96\x91\xd0\x8c\x97\xff"
+chain = rop.write_to_mem(0x61b000, shellcode)
+```
+
+### Writing with Register Preservation
+
+```python
+# Write data without modifying rax
+chain = rop.write_to_mem(0x61b100, b"data", preserve_regs={'rax'})
+```
+
+### Building Execve Chain
+
+```python
+# Write "/bin/sh" to memory
+chain = rop.write_to_mem(0x61b100, b"/bin/sh\x00")
+
+# Call execve with the string address
+chain += rop.func_call("execve", [0x61b100, 0, 0])
+
+# Or use convenience method
+chain = rop.execve()  # Automatically writes and calls
+```
+
+### Writing File Paths
+
+```python
+import os
+
+# Write file path
+chain = rop.write_to_mem(0x61b100, b"/home/ctf/flag\x00")
+
+# Open file
+chain += rop.func_call("open", [0x61b100, os.O_RDONLY])
+
+# Read into buffer  
+chain += rop.func_call("read", [3, 0x61b200, 0x100])
+
+# Write to stdout
+chain += rop.func_call("write", [1, 0x61b200, 0x100])
+```
+
+### Writing with Badbytes
+
+```python
+proj = angr.Project("/bin/bash")
+rop = proj.analyses.ROP()
+rop.set_badbytes([0x00, 0x0a])
+rop.find_gadgets()
+
+# Data contains badbytes
+data = b"\x00\x0a\x0d\xff"
+chain = rop.write_to_mem(0x61b100, data)
+
+# MemWriter automatically:
+# 1. Writes safe initial values
+# 2. Uses mem_xor/mem_add/etc to construct target bytes
+```
+
+### Building Data Structures
+
+```python
+import struct
+
+struct_addr = 0x61b100
+
+# Write struct fields
+chain = rop.write_to_mem(struct_addr + 0, struct.pack('<Q', 0x1234))
+chain += rop.write_to_mem(struct_addr + 8, struct.pack('<Q', 0x5678))
+chain += rop.write_to_mem(struct_addr + 16, b"name\x00")
+```
+
+### Writing Pointer Arrays
+
+```python
+# Build argv array for execve
+argv_addr = 0x61b200
+arg0_addr = 0x61b100
+
+# Write the string
+chain = rop.write_to_mem(arg0_addr, b"/bin/sh\x00")
+
+# Write pointer array
+chain += rop.write_to_mem(argv_addr, struct.pack('<Q', arg0_addr))
+chain += rop.write_to_mem(argv_addr + 8, struct.pack('<Q', 0))  # NULL
+
+# Call execve
+chain += rop.func_call("execve", [arg0_addr, argv_addr, 0])
+```
+
+## Write Size Optimization
+
+MemWriter automatically chooses optimal chunk sizes:
+
+```python
+# For 8-byte data:
+mov qword ptr [rax], rbx; ret  # 1 write of 8 bytes
+
+# For 3-byte data:
+mov word ptr [rax], bx; ret    # 1 write of 2 bytes
+mov byte ptr [rax+2], bl; ret  # 1 write of 1 byte
+
+# Prefers larger writes for efficiency
+```
+
+## Error Handling
+
+### "Fail to write data to memory :("
+
+Raised when no suitable gadgets are found.
+
+**Solutions:**
+1. Use `fast_mode=False` when initializing ROP
+2. Check if binary has memory write gadgets
+3. Try alternative addresses or data
+
+### "fill_byte is a bad byte!"
+
+Raised when fill_byte contains a badbyte.
+
+**Solution:** Choose a different fill_byte that's not in badbytes.
+
+### "cannot write to a symbolic address"
+
+Raised when addr parameter is symbolic.
+
+**Solution:** Use a concrete address value.
+
+### "data is not a byte string"
+
+Raised when data is not bytes type.
+
+**Solution:** Convert to bytes: `data.encode()` or `bytes([...])`
+
+## Gadget Requirements
+
+For memory writes to work:
+
+1. **Controllable address**: Can set address register to any value
+2. **Controllable data**: Can set data register to any value  
+3. **Independence**: Address and data registers are different
+4. **Self-contained**: Gadget doesn't require special initial state
+
+Example verification from source code (mem_writer.py:413-422):
+
+```python
+mem_write = gadget.mem_writes[0]
+dep_regs = mem_write.addr_dependencies | mem_write.data_dependencies
+if not dep_regs.issubset(can_set_regs):
+    # Can't set required registers
+    continue
+```
+
+## Performance Considerations
+
+- Writing large data may generate long chains
+- Badbyte handling adds overhead (arithmetic operations)
+- Caching reduces overhead for repeated writes
+- Chunk size optimization minimizes total gadgets used
+
+## See Also
+
+- [MemChanger](/api/mem-changer) - Arithmetic operations on memory
+- [Memory Operations Guide](/guides/memory-operations) - Usage examples
+- [Badbytes Guide](/guides/badbytes) - Handling restricted bytes

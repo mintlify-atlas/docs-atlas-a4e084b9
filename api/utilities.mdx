@@ -1,0 +1,548 @@
+---
+title: 'Utilities'
+description: 'Utility functions and error classes for advanced angrop usage'
+---
+
+## Utility Functions
+
+angrop provides a comprehensive set of utility functions in `rop_utils.py` for working with symbolic execution, gadget analysis, and ROP chain construction.
+
+### Address and Assembly
+
+#### addr_to_asmstring
+
+```python
+def addr_to_asmstring(project, addr) -> str
+```
+
+Converts an address to a human-readable assembly string.
+
+<ParamField path="project" type="angr.Project" required>
+  The project containing the binary
+</ParamField>
+
+<ParamField path="addr" type="int" required>
+  The address to disassemble
+</ParamField>
+
+**Returns:** String of semicolon-separated instructions (e.g., `"pop rax; pop rbx; ret"`)
+
+**Example:**
+```python
+asm = addr_to_asmstring(project, 0x401000)
+print(asm)  # "mov eax, ebx; add eax, 0x10; ret"
+```
+
+### AST Dependency Analysis
+
+#### get_ast_dependency
+
+```python
+def get_ast_dependency(ast) -> set
+```
+
+Identifies which registers affect a symbolic AST expression.
+
+<ParamField path="ast" type="claripy.ast.BV" required>
+  The AST to analyze. Must be created from a symbolic state where registers are named `"sreg_REG-"`
+</ParamField>
+
+**Returns:** Set of register names that affect the AST value
+
+**Algorithm:**
+- Extracts all variables starting with `"sreg_"`
+- Returns the register name portion (e.g., `"sreg_rax-123"` → `"rax"`)
+- Returns empty set if any non-register variables are found
+
+**Example:**
+```python
+# After symbolic execution
+rax_val = final_state.registers.load('rax')
+deps = get_ast_dependency(rax_val)
+print(deps)  # {'rbx', 'rcx'}  (rax depends on rbx and rcx)
+```
+
+#### get_ast_controllers
+
+```python
+def get_ast_controllers(state, ast, reg_deps) -> set
+```
+
+Identifies which registers can fully control (unconstrain) an AST expression.
+
+<ParamField path="state" type="angr.SimState" required>
+  The symbolic state
+</ParamField>
+
+<ParamField path="ast" type="claripy.ast.BV" required>
+  The AST to analyze
+</ParamField>
+
+<ParamField path="reg_deps" type="set" required>
+  Set of register dependencies (from `get_ast_dependency`)
+</ParamField>
+
+**Returns:** Set of register names that can make the AST take arbitrary values
+
+**Algorithm:**
+1. For each dependent register, set all other registers to a test value
+2. Check if the resulting AST is unconstrained using `fast_unconstrained_check`
+3. Return registers that allow arbitrary values
+
+**Example:**
+```python
+# rax = rbx + rcx + 0x1000
+controllers = get_ast_controllers(state, rax_val, {'rbx', 'rcx'})
+print(controllers)  # {'rbx', 'rcx'}
+
+# rax = (rbx & 0xFF) + rcx
+controllers = get_ast_controllers(state, rax_val, {'rbx', 'rcx'})
+print(controllers)  # {'rcx'}  (rbx is constrained by AND)
+```
+
+#### get_ast_const_offset
+
+```python
+def get_ast_const_offset(state, ast, reg_deps) -> int
+```
+
+Extracts the constant offset from a memory access expression.
+
+<ParamField path="state" type="angr.SimState" required>
+  The symbolic state
+</ParamField>
+
+<ParamField path="ast" type="claripy.ast.BV" required>
+  The memory address AST
+</ParamField>
+
+<ParamField path="reg_deps" type="set" required>
+  Register dependencies
+</ParamField>
+
+**Returns:** The constant offset value
+
+**Example:**
+```python
+# mov [rax + 0x10], rbx
+addr_ast = mem_write_action.addr.ast
+offset = get_ast_const_offset(state, addr_ast, {'rax'})
+print(offset)  # 0x10
+```
+
+### Constraint Checking
+
+#### unconstrained_check
+
+```python
+def unconstrained_check(state, ast) -> bool
+```
+
+Checks if an AST is completely unconstrained (can take any value).
+
+**Returns:** `True` if the AST has no constraints in the solver
+
+#### fast_unconstrained_check
+
+```python
+def fast_unconstrained_check(state, ast) -> bool
+```
+
+Quickly checks if an AST is probably unconstrained using heuristics.
+
+**Heuristics:**
+1. **Allowed operations:** Extract, BVS, add, sub, xor, Reverse, BVV, ZeroExt, SignExt
+2. **Disallowed patterns:**
+   - Bitwise AND with non-all-ones constant
+   - Bitwise OR with non-zero constant
+   - Shifts by non-zero amount
+   - Operations like `x + x` (constrained)
+3. **Byte-level check:** Each byte must be unconstrained
+4. **Fallback:** Uses `loose_constrained_check` if heuristics pass
+
+**Example:**
+```python
+# rax is completely controllable
+if fast_unconstrained_check(state, state.regs.rax):
+    print("Can set rax to any value")
+
+# (rax & 0xFF) is constrained
+if not fast_unconstrained_check(state, state.regs.rax & 0xFF):
+    print("Cannot fully control lower byte")
+```
+
+#### loose_constrained_check
+
+```python
+def loose_constrained_check(state, ast, extra_constraints=None) -> bool
+```
+
+Checks if an AST can take at least 3 out of 5 test values.
+
+**Test values:**
+1. `0x0`
+2. `0xFFFFFFFF...` (all ones)
+3. `0xAAAAAAAA...` (alternating)
+4. `0x55555555...` (alternating)
+5. `0x9ABC...` (mixed pattern)
+
+**Returns:** `True` if at most 2 test values are unsatisfiable
+
+### Register Utilities
+
+#### get_reg_name
+
+```python
+def get_reg_name(arch, reg_offset) -> str
+```
+
+Finds the register name for a given offset in the register file.
+
+<ParamField path="arch" type="angrop.arch.Arch" required>
+  Architecture instance
+</ParamField>
+
+<ParamField path="reg_offset" type="int" required>
+  Byte offset in the register file
+</ParamField>
+
+**Returns:** Register name
+
+**Raises:** `RegNotFoundException` if no register found at offset
+
+**Example:**
+```python
+from angrop.arch import get_arch
+
+arch = get_arch(project)
+reg_name = get_reg_name(arch, 0)  # "rax" on x64
+```
+
+### State Creation
+
+#### make_initial_state
+
+```python
+def make_initial_state(project, stack_gsize) -> angr.SimState
+```
+
+Creates an optimized initial state for ROP analysis.
+
+**Features:**
+- Custom memory plugin (`SpecialMem`) for faster uninitialized memory
+- Symbolic stack of size `stack_gsize * arch.bytes`
+- Optimized angr options for gadget analysis
+- 1-second solver timeout
+
+**Options enabled:**
+- `CONSERVATIVE_READ_STRATEGY`
+- `AVOID_MULTIVALUED_WRITES`
+- `NO_SYMBOLIC_JUMP_RESOLUTION`
+- `TRACK_ACTION_HISTORY`
+- `TRACK_REGISTER_ACTIONS`
+- `TRACK_MEMORY_ACTIONS`
+
+**Options disabled:**
+- `AVOID_MULTIVALUED_READS`
+- `SUPPORT_FLOATING_POINT`
+- All resilience and simplification options
+
+#### make_symbolic_state
+
+```python
+def make_symbolic_state(project, reg_set, stack_gsize, extra_reg_set=None, symbolize_got=False) -> angr.SimState
+```
+
+Creates a symbolic state with specified registers symbolized.
+
+<ParamField path="project" type="angr.Project" required>
+  The angr project
+</ParamField>
+
+<ParamField path="reg_set" type="set" required>
+  Registers to symbolize (named `"sreg_REG-"`)
+</ParamField>
+
+<ParamField path="stack_gsize" type="int" required>
+  Symbolic stack size in pointer-sized elements
+</ParamField>
+
+<ParamField path="extra_reg_set" type="set | None" default="None">
+  Additional registers to symbolize (named `"esreg_REG-"`)
+</ParamField>
+
+<ParamField path="symbolize_got" type="bool" default="False">
+  Symbolize the GOT table (for non-FULL RELRO binaries)
+</ParamField>
+
+**Example:**
+```python
+state = make_symbolic_state(
+    project, 
+    reg_set={'rax', 'rbx', 'rcx'},
+    stack_gsize=80
+)
+# state.regs.rax is now symbolic (BVS("sreg_rax-...", 64))
+```
+
+### Execution Control
+
+#### step_one_inst
+
+```python
+def step_one_inst(project, state, stop_at_syscall=False) -> angr.SimState
+```
+
+Steps a state forward by exactly one instruction.
+
+**Handles:**
+- Kernel execution (steps through if not `stop_at_syscall`)
+- Hooked addresses (steps through)
+
+#### step_to_unconstrained_successor
+
+```python
+def step_to_unconstrained_successor(project, state, max_steps=2, allow_simprocedures=False, stop_at_syscall=False) -> angr.SimState
+```
+
+Steps until reaching an unconstrained successor or syscall.
+
+<ParamField path="max_steps" type="int" default="2">
+  Maximum steps to take
+</ParamField>
+
+**Returns:** State at unconstrained successor or syscall
+
+**Raises:** `RopException` if cannot reach unconstrained state
+
+#### step_to_syscall
+
+```python
+def step_to_syscall(state) -> angr.SimState
+```
+
+Steps state forward until just before a syscall instruction.
+
+**Returns:** State at syscall instruction
+
+**Raises:** `RuntimeError` if unable to reach syscall
+
+### Address Checking
+
+#### is_kernel_addr
+
+```python
+def is_kernel_addr(project, addr) -> bool
+```
+
+Checks if an address is in kernel space.
+
+**Returns:** `True` if the address belongs to the kernel object (`cle##kernel`)
+
+#### is_in_kernel
+
+```python
+def is_in_kernel(project, state) -> bool
+```
+
+Checks if a state's instruction pointer is in kernel space.
+
+### Timeout Decorator
+
+#### timeout
+
+```python
+@timeout(seconds_before_timeout)
+def your_function(...):
+    # Your code here
+```
+
+Decorator that raises `RopTimeoutException` if function exceeds time limit.
+
+**Features:**
+- Uses SIGALRM signal
+- Handles nested timeouts (respects shortest timeout)
+- Delays timeout during `__del__` methods to avoid exceptions during cleanup
+
+**Example:**
+```python
+from angrop.rop_utils import timeout
+from angrop.errors import RopTimeoutException
+
+@timeout(3)
+def analyze_gadget(addr):
+    # This will timeout after 3 seconds
+    result = expensive_analysis(addr)
+    return result
+
+try:
+    gadget = analyze_gadget(0x401000)
+except RopTimeoutException:
+    print("Analysis timed out")
+```
+
+### Value Conversion
+
+#### cast_rop_value
+
+```python
+def cast_rop_value(val, project) -> RopValue
+```
+
+Converts a value to a `RopValue` instance and performs rebase analysis.
+
+#### bits_extended
+
+```python
+def bits_extended(ast) -> int | None
+```
+
+Returns the number of bits added by ZeroExt or SignExt operations.
+
+**Example:**
+```python
+# ast = ZeroExt(32, BVS('x', 32))
+bits = bits_extended(ast)  # 32
+```
+
+## Error Classes
+
+angrop defines custom exceptions in `errors.py` for fine-grained error handling.
+
+### RegNotFoundException
+
+```python
+class RegNotFoundException(Exception)
+```
+
+Raised when a register cannot be found at a specified offset.
+
+**Example:**
+```python
+from angrop.rop_utils import get_reg_name
+from angrop.errors import RegNotFoundException
+
+try:
+    reg = get_reg_name(arch, 9999)
+except RegNotFoundException as e:
+    print(f"Register not found: {e}")
+```
+
+### RopException
+
+```python
+class RopException(Exception)
+```
+
+Base exception for general ROP analysis errors.
+
+**Common scenarios:**
+- Gadget does not reach unconstrained state
+- Cannot get to single successor
+- SP change is symbolic or uncontrolled
+- Memory access with no dependencies
+
+**Example:**
+```python
+from angrop.errors import RopException
+
+try:
+    gadget = analyze_complex_gadget(addr)
+except RopException as e:
+    print(f"Gadget analysis failed: {e}")
+```
+
+### RopTimeoutException
+
+```python
+class RopTimeoutException(RopException)
+```
+
+Raised when gadget analysis exceeds the timeout limit.
+
+**Usage with timeout decorator:**
+```python
+from angrop.rop_utils import timeout
+from angrop.errors import RopTimeoutException
+
+@timeout(3)
+def slow_analysis(addr):
+    # Analysis code
+    pass
+
+try:
+    slow_analysis(0x401000)
+except RopTimeoutException:
+    print("Analysis exceeded 3 second timeout")
+```
+
+## Common Patterns
+
+### Custom Gadget Analysis
+
+```python
+from angrop.rop_utils import (
+    make_symbolic_state,
+    step_to_unconstrained_successor,
+    get_ast_dependency,
+    get_ast_controllers
+)
+from angrop.errors import RopException
+
+def analyze_custom_gadget(project, addr, arch):
+    # Create symbolic state
+    state = make_symbolic_state(
+        project,
+        reg_set=arch.reg_list,
+        stack_gsize=80
+    )
+    state.ip = addr
+    
+    try:
+        # Step to unconstrained
+        final_state = step_to_unconstrained_successor(
+            project, state, max_steps=2
+        )
+        
+        # Analyze register effects
+        rax_val = final_state.registers.load('rax')
+        deps = get_ast_dependency(rax_val)
+        controllers = get_ast_controllers(state, rax_val, deps)
+        
+        return {
+            'addr': addr,
+            'rax_deps': deps,
+            'rax_controllers': controllers
+        }
+    except RopException as e:
+        return None
+```
+
+### Memory Access Validation
+
+```python
+from angrop.rop_utils import (
+    get_ast_dependency,
+    get_ast_controllers,
+    get_ast_const_offset
+)
+
+def analyze_memory_write(state, action):
+    addr_ast = action.addr.ast
+    data_ast = action.data.ast
+    
+    # Analyze address
+    addr_deps = get_ast_dependency(addr_ast)
+    addr_controllers = get_ast_controllers(state, addr_ast, addr_deps)
+    addr_offset = get_ast_const_offset(state, addr_ast, addr_deps)
+    
+    # Analyze data
+    data_deps = get_ast_dependency(data_ast)
+    data_controllers = get_ast_controllers(state, data_ast, data_deps)
+    
+    return {
+        'addr_controlled_by': addr_controllers,
+        'addr_offset': addr_offset,
+        'data_controlled_by': data_controllers
+    }
+```

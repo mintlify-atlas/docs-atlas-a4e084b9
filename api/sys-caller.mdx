@@ -1,0 +1,493 @@
+---
+title: SysCaller
+description: System call chain builder for invoking syscalls with automatic argument setup
+---
+
+The `SysCaller` class builds ROP chains that invoke system calls, automatically handling syscall numbers and arguments according to the platform's syscall convention.
+
+## Overview
+
+Accessed through the ROP instance as `rop.do_syscall()` and `rop.execve()`, SysCaller automatically:
+- Sets syscall number register (rax on x64, eax on x86, r7 on ARM)
+- Sets argument registers according to syscall convention
+- Handles both returning and non-returning syscalls
+- Finds optimal syscall gadgets
+- Supports execve convenience method
+
+## Class Definition
+
+```python
+class SysCaller(FuncCaller)
+```
+
+Inherits from `FuncCaller` and extends it with syscall-specific functionality.
+
+Located in `angrop/chain_builder/sys_caller.py`
+
+## Public Methods
+
+### do_syscall
+
+```python
+do_syscall(syscall_num, args, needs_return=True, preserve_regs=None) -> RopChain
+```
+
+Builds a ROP chain that invokes a system call.
+
+<ParamField path="syscall_num" type="int" required>
+  System call number. Examples:
+  - Linux x64: `execve=59`, `read=0`, `write=1`, `open=2`
+  - Linux x86: `execve=11`, `read=3`, `write=4`, `open=5`
+</ParamField>
+
+<ParamField path="args" type="list" required>
+  List of syscall arguments. Number and meaning depend on the specific syscall.
+</ParamField>
+
+<ParamField path="needs_return" type="bool" default="True">
+  Whether control flow should continue after the syscall. Set to False for syscalls like execve that don't return.
+</ParamField>
+
+<ParamField path="preserve_regs" type="set | None" default="None">
+  Set of register names that should not be modified.
+</ParamField>
+
+**Returns:** A `RopChain` that invokes the syscall.
+
+**Raises:** `RopException` if syscall cannot be invoked.
+
+### execve
+
+```python
+execve(path=None, path_addr=None) -> RopChain
+```
+
+Convenience method to invoke execve syscall with `/bin/sh`.
+
+<ParamField path="path" type="bytes | None" default="b'/bin/sh\\x00'">
+  Command to execute. Must be null-terminated.
+</ParamField>
+
+<ParamField path="path_addr" type="int | None" default="None">
+  Address to write the path string. If None, automatically finds writable memory.
+</ParamField>
+
+**Returns:** A complete ROP chain that spawns a shell.
+
+**Raises:** `RopException` if execve cannot be invoked.
+
+### verify
+
+```python
+verify(chain, registers, preserve_regs) -> bool
+```
+
+Verifies that a syscall chain correctly sets registers.
+
+<ParamField path="chain" type="RopChain" required>
+  Chain to verify.
+</ParamField>
+
+<ParamField path="registers" type="dict" required>
+  Target register values.
+</ParamField>
+
+<ParamField path="preserve_regs" type="set" required>
+  Registers that should not be modified.
+</ParamField>
+
+**Returns:** True if verification passes, False otherwise.
+
+## ROP Instance Methods
+
+```python
+rop.do_syscall(syscall_num, args, needs_return=True, preserve_regs=None)
+rop.execve(path=None, path_addr=None)
+```
+
+## Implementation Details
+
+### Syscall Convention Detection
+
+SysCaller uses angr's syscall calling convention:
+
+From source code (sys_caller.py:42):
+
+```python
+self.sysnum_reg = self.project.arch.register_names[
+    self.project.arch.syscall_num_offset
+]
+```
+
+### Syscall Conventions by Architecture
+
+#### x86_64 Linux
+```python
+# Syscall number: rax
+# Arguments: rdi, rsi, rdx, r10, r8, r9
+# Return: rax
+# Instruction: syscall
+
+cc = angr.SYSCALL_CC["AMD64"]["default"]
+```
+
+#### x86 (32-bit) Linux
+```python
+# Syscall number: eax
+# Arguments: ebx, ecx, edx, esi, edi, ebp
+# Return: eax
+# Instruction: int 0x80
+
+cc = angr.SYSCALL_CC["X86"]["default"]
+```
+
+#### ARM Linux
+```python
+# Syscall number: r7
+# Arguments: r0, r1, r2, r3, r4, r5
+# Return: r0
+# Instruction: svc 0
+
+cc = angr.SYSCALL_CC["ARMEL"]["default"]
+```
+
+### Gadget Filtering
+
+From source code (sys_caller.py:80-84):
+
+```python
+def filter_gadgets(self, gadgets) -> list:
+    # Only non-negative stack changes
+    gadgets = list({g for g in gadgets if g.stack_change >= 0})
+    return sorted(gadgets, key=functools.cmp_to_key(cmp))
+```
+
+Gadgets are sorted by:
+1. Can return (preferred)
+2. Fewer symbolic memory accesses
+3. Smaller stack change
+4. Fewer instructions
+
+### Per-Request Gadget Filtering
+
+SysCaller optimizes gadget selection per syscall:
+
+From source code (sys_caller.py:140-175):
+
+```python
+def _per_request_filtering(self, syscall_num, registers, preserve_regs, needs_return):
+    gadgets = self.syscall_gadgets
+    
+    if needs_return:
+        gadgets = [x for x in gadgets if x.can_return]
+    
+    # Filter by concrete register values
+    def concrete_val_ok(g):
+        for key, val in g.prologue.concrete_regs.items():
+            if key in registers and registers[key] != val:
+                return False
+            if key == self.sysnum_reg and val != syscall_num:
+                return False
+        return True
+    
+    gadgets = [x for x in gadgets if concrete_val_ok(x)]
+    
+    # Prioritize gadgets that set more arguments
+    return sorted(gadgets, reverse=True, key=lambda g: len(good_sets))
+```
+
+## Usage Examples
+
+### Basic Syscall
+
+```python
+import angr
+import angrop
+
+proj = angr.Project("/bin/bash")
+rop = proj.analyses.ROP()
+rop.find_gadgets()
+
+# execve syscall on x86_64 Linux (syscall number 59)
+chain = rop.do_syscall(59, [0x61b100, 0, 0])
+```
+
+### Execve Shell
+
+```python
+# Simplest way - automatic everything
+chain = rop.execve()
+
+# Custom path
+chain = rop.execve(path=b"/bin/bash\x00")
+
+# Custom address
+chain = rop.execve(path_addr=0x61b100)
+```
+
+### Read Syscall
+
+```python
+# read(0, buffer, size)
+chain = rop.do_syscall(0, [0, 0x61b100, 0x100])
+```
+
+### Write Syscall
+
+```python
+# write(1, buffer, size)
+chain = rop.do_syscall(1, [1, 0x61b100, 0x100])
+```
+
+### Open Syscall
+
+```python
+import os
+
+# open(path, O_RDONLY)
+chain = rop.write_to_mem(0x61b100, b"/etc/passwd\x00")
+chain += rop.do_syscall(2, [0x61b100, os.O_RDONLY])
+```
+
+### Non-Returning Syscall
+
+```python
+# exit(0) - doesn't return
+chain = rop.do_syscall(60, [0], needs_return=False)
+
+# execve - doesn't return
+chain = rop.do_syscall(59, [0x61b100, 0, 0], needs_return=False)
+```
+
+### Complete File Read Example
+
+```python
+proj = angr.Project("./binary")
+rop = proj.analyses.ROP()
+rop.find_gadgets()
+
+# Write filename
+chain = rop.write_to_mem(0x61b100, b"/home/ctf/flag\x00")
+
+# open(filename, O_RDONLY)
+chain += rop.do_syscall(2, [0x61b100, 0])
+
+# read(fd, buffer, size) - fd is in rax
+chain += rop.move_regs(rdi='rax')
+chain += rop.do_syscall(0, [], preserve_regs={'rdi'})
+chain += rop.set_regs(rsi=0x61b200, rdx=0x100, preserve_regs={'rdi'})
+
+# write(1, buffer, size)
+chain += rop.do_syscall(1, [1, 0x61b200, 0x100])
+```
+
+### Chaining Syscalls
+
+```python
+# Create file
+chain = rop.write_to_mem(0x61b100, b"/tmp/test\x00")
+chain += rop.do_syscall(2, [0x61b100, os.O_CREAT | os.O_WRONLY, 0o644])
+
+# Write to it
+chain += rop.move_regs(rdi='rax')  # fd from open
+chain += rop.write_to_mem(0x61b200, b"Hello World\n")
+chain += rop.do_syscall(1, [], preserve_regs={'rdi'})
+chain += rop.set_regs(rsi=0x61b200, rdx=12, preserve_regs={'rdi'})
+
+# Close it
+chain += rop.do_syscall(3, [], preserve_regs={'rdi'})
+```
+
+### Preserving Registers Across Syscalls
+
+```python
+# Set argument and preserve it
+chain = rop.set_regs(rdi=0x61b100)
+chain += rop.do_syscall(0, [], preserve_regs={'rdi'})
+chain += rop.set_regs(rsi=0x100, rdx=0, preserve_regs={'rdi'})
+# rdi still contains 0x61b100
+```
+
+## Execve Implementation
+
+From source code (sys_caller.py:86-131):
+
+```python
+def execve(self, path=None, path_addr=None):
+    if self.project.simos.name != 'Linux':
+        raise RopException(f"{self.project.simos.name} is not supported!")
+    
+    # Determine path
+    if path is None:
+        path = b"/bin/sh\x00"
+    if path[-1] != 0:
+        path += b"\x00"
+    
+    # Find writable memory
+    if path_addr is None:
+        path_addr = self._get_ptr_to_writable(len(path) + arch_bytes)
+        if path_addr is None:
+            raise RopException("Fail to find writable region")
+    
+    # Write path
+    chain = self.chain_builder.write_to_mem(path_addr, path)
+    
+    # Try execve(path, ptr, ptr)
+    if 0 not in self.badbytes:
+        ptr = 0
+    else:
+        ptr = self._get_ptr_to_null()
+    
+    chain2 = self.do_syscall(execve_num, [path_addr, ptr, ptr], 
+                            needs_return=False)
+    return chain + chain2
+```
+
+## Syscall Verification
+
+From source code (sys_caller.py:51-78):
+
+```python
+@staticmethod
+def verify(chain, registers, preserve_regs):
+    # Remove preserved registers from check
+    registers = dict(registers)
+    for reg in preserve_regs:
+        if reg in registers:
+            del registers[reg]
+    
+    # Execute until syscall
+    try:
+        state = chain.sim_exec_til_syscall()
+    except RuntimeError:
+        return False
+    
+    if state is None:
+        return False
+    
+    # Verify all registers
+    for reg, val in registers.items():
+        bv = getattr(state.regs, reg)
+        if (val.symbolic != bv.symbolic) or state.solver.eval(bv != val.data):
+            return False
+    
+    return True
+```
+
+## Common Syscall Numbers
+
+### Linux x86_64
+
+```python
+SYSCALLS_X64 = {
+    'read': 0,
+    'write': 1,
+    'open': 2,
+    'close': 3,
+    'execve': 59,
+    'exit': 60,
+    'mprotect': 10,
+    'mmap': 9,
+}
+
+chain = rop.do_syscall(SYSCALLS_X64['execve'], [path, 0, 0])
+```
+
+### Linux x86 (32-bit)
+
+```python
+SYSCALLS_X86 = {
+    'read': 3,
+    'write': 4,
+    'open': 5,
+    'close': 6,
+    'execve': 11,
+    'exit': 1,
+    'mprotect': 125,
+    'mmap': 90,
+}
+```
+
+### Linux ARM
+
+```python
+SYSCALLS_ARM = {
+    'read': 3,
+    'write': 4,
+    'open': 5,
+    'close': 6,
+    'execve': 11,
+    'exit': 1,
+}
+```
+
+## Error Handling
+
+### "target does not contain syscall gadget!"
+
+Raised when no syscall gadgets are found.
+
+**Solutions:**
+1. Binary may not have syscall instructions
+2. Try using function calls instead: `rop.func_call("syscall", [...])`
+3. Check if binary is statically linked
+
+### "Fail to invoke syscall {num} with arguments: {args}!"
+
+Raised when syscall chain cannot be built.
+
+**Solutions:**
+1. Run `find_gadgets(optimize=True)`
+2. Try `needs_return=False` for simpler chain
+3. Check if arguments are valid for the syscall
+4. Verify syscall number is correct for the architecture
+
+### "Fail to invoke execve!"
+
+Raised when execve cannot be invoked.
+
+**Solutions:**
+1. Provide explicit `path_addr` to writable memory
+2. Check badbytes configuration
+3. Try `rop.do_syscall(execve_num, [...])` directly
+
+## Platform Support
+
+### Operating Systems
+
+From source code (sys_caller.py:45-46):
+
+```python
+@staticmethod
+def supported_os(os):
+    return "unix" in os.lower()
+```
+
+Supported:
+- Linux (all architectures)
+- BSD variants
+- Other Unix-like systems
+
+Not supported:
+- Windows (uses different syscall mechanism)
+
+## Best Practices
+
+1. **Use execve() for shells** - Simplest and most reliable
+2. **Set needs_return=False** - For syscalls that don't return (execve, exit)
+3. **Preserve return values** - Move rax to another register if needed
+4. **Verify syscall numbers** - They differ across architectures
+5. **Handle file descriptors** - Save fd from open for read/write
+
+## Performance Considerations
+
+- Gadget filtering reduces search space significantly
+- Concrete value matching optimizes gadget selection
+- Verification adds overhead but ensures correctness
+- Non-returning syscalls generate shorter chains
+
+## See Also
+
+- [FuncCaller](/api/func-caller) - Function calling (parent class)
+- [SigreturnBuilder](/api/sigreturn) - SROP chains
+- [Syscalls Guide](/guides/syscalls) - Usage examples and patterns

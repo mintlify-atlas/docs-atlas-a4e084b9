@@ -1,0 +1,465 @@
+---
+title: RopGadget Classes
+description: Gadget representation classes for ROP chain building
+---
+
+angrop provides several gadget classes to represent different types of ROP gadgets discovered during analysis. These classes extend `RopEffect` and encapsulate gadget properties, transitions, and behaviors.
+
+## RopGadget
+
+The base class for all ROP gadgets.
+
+### Class Definition
+
+```python
+class RopGadget(RopEffect)
+```
+
+### Constructor
+
+```python
+RopGadget(addr)
+```
+
+<ParamField path="addr" type="int" required>
+  Address where the gadget starts.
+</ParamField>
+
+### Attributes
+
+<ResponseField name="addr" type="int">
+  Address of the gadget.
+</ResponseField>
+
+<ResponseField name="project" type="angr.Project | None">
+  Reference to the angr project.
+</ResponseField>
+
+<ResponseField name="transit_type" type="str | None">
+  Type of gadget transition:
+  - `"pop_pc"` - Returns via ret, `jmp [sp+X]`, `pop pc`, or `retn` (self-contained)
+  - `"jmp_reg"` - Jumps to a register value (requires prior register setting)
+  - `"jmp_mem"` - Jumps to a memory location (requires prior memory setup)
+</ResponseField>
+
+<ResponseField name="pc_offset" type="int | None">
+  For `pop_pc` gadgets: offset from stack pointer to PC value. For ret instructions, this is `stack_change - arch.bytes`.
+</ResponseField>
+
+<ResponseField name="pc_reg" type="str | None">
+  For `jmp_reg` gadgets: name of the register that contains the jump target.
+</ResponseField>
+
+<ResponseField name="pc_target" type="any">
+  For `jmp_mem` gadgets: memory location that contains the jump target.
+</ResponseField>
+
+### Inherited Attributes from RopEffect
+
+RopGadget inherits many attributes from `RopEffect` that describe the gadget's behavior:
+
+<ResponseField name="stack_change" type="int">
+  Change in stack pointer after gadget execution.
+</ResponseField>
+
+<ResponseField name="changed_regs" type="set[str]">
+  Set of registers modified by the gadget.
+</ResponseField>
+
+<ResponseField name="reg_pops" type="dict">
+  Dictionary mapping registers to their pop offsets from the stack.
+</ResponseField>
+
+<ResponseField name="reg_moves" type="list">
+  List of register-to-register moves performed by the gadget.
+</ResponseField>
+
+<ResponseField name="reg_dependencies" type="dict">
+  Dictionary showing which registers each output register depends on.
+</ResponseField>
+
+<ResponseField name="reg_controllers" type="dict">
+  Dictionary showing which registers directly control each output register.
+</ResponseField>
+
+<ResponseField name="mem_writes" type="list">
+  List of memory write operations performed.
+</ResponseField>
+
+<ResponseField name="mem_reads" type="list">
+  List of memory read operations performed.
+</ResponseField>
+
+<ResponseField name="mem_changes" type="list">
+  List of memory modification operations (add, sub, xor, etc.).
+</ResponseField>
+
+<ResponseField name="has_conditional_branch" type="bool">
+  Whether the gadget contains conditional branches.
+</ResponseField>
+
+<ResponseField name="oop" type="bool">
+  Whether the gadget is an "out-of-place" gadget (non-standard behavior).
+</ResponseField>
+
+<ResponseField name="bbl_addrs" type="list[int]">
+  List of basic block addresses that make up the gadget.
+</ResponseField>
+
+### Properties
+
+#### self_contained
+
+```python
+@property
+self_contained -> bool
+```
+
+Returns True if the gadget is self-contained and doesn't rely on other gadgets. A gadget is self-contained if:
+- It has no conditional branches
+- Its transit type is `"pop_pc"`
+- It's not an out-of-place (oop) gadget
+
+### Methods
+
+#### dstr
+
+```python
+dstr() -> str
+```
+
+Returns a disassembly string showing the gadget's instructions separated by semicolons.
+
+**Returns:** String like `"pop rax; pop rbx; ret"`.
+
+#### pp
+
+```python
+pp()
+```
+
+Pretty-prints the disassembly string to stdout.
+
+#### copy
+
+```python
+copy() -> RopGadget
+```
+
+Creates a deep copy of the gadget.
+
+**Returns:** New RopGadget instance with copied attributes.
+
+#### \_\_str\_\_
+
+```python
+__str__() -> str
+```
+
+Detailed string representation including:
+- Address
+- Stack change
+- Changed/popped registers
+- Register moves
+- Register dependencies and controllers
+- Memory operations (reads, writes, changes)
+
+**Example Output:**
+```
+Gadget 0x400123
+Stack change: 0x10
+Changed registers: {'rax', 'rbx'}
+Popped registers: {'rax': 0, 'rbx': 8}
+Register dependencies:
+    rax: [sp ()] 
+    rbx: [sp ()] 
+```
+
+#### \_\_repr\_\_
+
+```python
+__repr__() -> str
+```
+
+**Returns:** String like `"<Gadget 0x400123>"`.
+
+## PivotGadget
+
+Represents a stack pivot gadget that can arbitrarily control the stack pointer.
+
+### Class Definition
+
+```python
+class PivotGadget(RopGadget)
+```
+
+A PivotGadget can control the stack pointer register and performs the pivot exactly once.
+
+### Constructor
+
+```python
+PivotGadget(addr)
+```
+
+<ParamField path="addr" type="int" required>
+  Address where the pivot gadget starts.
+</ParamField>
+
+### Additional Attributes
+
+<ResponseField name="stack_change_before_pivot" type="int">
+  Stack pointer change before the pivot occurs.
+</ResponseField>
+
+<ResponseField name="stack_change_after_pivot" type="int">
+  Stack pointer change after the pivot occurs.
+</ResponseField>
+
+<ResponseField name="sp_reg_controllers" type="set[str]">
+  Set of registers that control the new stack pointer value.
+</ResponseField>
+
+<ResponseField name="sp_stack_controllers" type="set">
+  Set of stack values that control the new stack pointer.
+</ResponseField>
+
+### Properties
+
+#### sp_controllers
+
+```python
+@property
+sp_controllers -> set
+```
+
+Returns the union of `sp_reg_controllers` and `sp_stack_controllers`.
+
+**Returns:** Complete set of stack pointer controllers.
+
+### Methods
+
+#### \_\_str\_\_
+
+```python
+__str__() -> str
+```
+
+**Example Output:**
+```
+PivotGadget 0x400789
+  sp_controllers: {'rbp'}
+  stack change: 0x8
+  stack change after pivot: 0x0
+```
+
+#### \_\_repr\_\_
+
+```python
+__repr__() -> str
+```
+
+**Returns:** String like `"<PivotGadget 0x400789>"`.
+
+#### copy
+
+```python
+copy() -> PivotGadget
+```
+
+Creates a deep copy of the pivot gadget.
+
+**Returns:** New PivotGadget instance.
+
+## SyscallGadget
+
+Represents a system call gadget.
+
+### Class Definition
+
+```python
+class SyscallGadget(RopGadget)
+```
+
+Collects two types of syscall gadgets:
+1. **With return:** `syscall; ret`
+2. **Without return:** `syscall; xxxx`
+
+### Constructor
+
+```python
+SyscallGadget(addr)
+```
+
+<ParamField path="addr" type="int" required>
+  Address where the syscall gadget starts.
+</ParamField>
+
+### Additional Attributes
+
+<ResponseField name="prologue" type="RopGadget | None">
+  Optional prologue gadget that executes before the syscall.
+</ResponseField>
+
+### Properties
+
+#### can_return
+
+```python
+@property
+can_return -> bool
+```
+
+Returns True if the syscall gadget has a return mechanism (i.e., `transit_type` is not None).
+
+**Returns:** Whether the gadget returns after the syscall.
+
+### Methods
+
+#### \_\_str\_\_
+
+```python
+__str__() -> str
+```
+
+**Example Output:**
+```
+SyscallGadget 0x400456
+  stack change: 0x8
+  can return: True
+```
+
+#### \_\_repr\_\_
+
+```python
+__repr__() -> str
+```
+
+**Returns:** String like `"<SyscallGadget 0x400456>"`.
+
+#### copy
+
+```python
+copy() -> SyscallGadget
+```
+
+Creates a deep copy of the syscall gadget.
+
+**Returns:** New SyscallGadget instance.
+
+## FunctionGadget
+
+Represents a function call gadget.
+
+### Class Definition
+
+```python
+class FunctionGadget(RopGadget)
+```
+
+### Constructor
+
+```python
+FunctionGadget(addr, symbol)
+```
+
+<ParamField path="addr" type="int" required>
+  Address of the function.
+</ParamField>
+
+<ParamField path="symbol" type="str" required>
+  Symbol name of the function.
+</ParamField>
+
+### Additional Attributes
+
+<ResponseField name="symbol" type="str">
+  Name/symbol of the function.
+</ResponseField>
+
+### Methods
+
+#### dstr
+
+```python
+dstr() -> str
+```
+
+Returns a formatted function name.
+
+**Returns:** String like `"<system>"` or `"<func_0x400123>"` if no symbol.
+
+## Usage Examples
+
+### Examining Gadgets
+
+```python
+import angr
+
+project = angr.Project('/bin/ls')
+rop = project.analyses.ROP()
+rop.find_gadgets()
+
+# Examine regular ROP gadgets
+for gadget in rop.rop_gadgets[:5]:
+    print(f"Address: {gadget.addr:#x}")
+    print(f"Instructions: {gadget.dstr()}")
+    print(f"Stack change: {gadget.stack_change:#x}")
+    print(f"Self-contained: {gadget.self_contained}")
+    print(f"Transit type: {gadget.transit_type}")
+    print()
+
+# Examine pivot gadgets
+for pivot in rop.pivot_gadgets[:3]:
+    print(f"Pivot at {pivot.addr:#x}")
+    print(f"Controllers: {pivot.sp_controllers}")
+    print(f"Stack change after pivot: {pivot.stack_change_after_pivot}")
+    print()
+
+# Examine syscall gadgets
+for syscall in rop.syscall_gadgets[:3]:
+    print(f"Syscall at {syscall.addr:#x}")
+    print(f"Can return: {syscall.can_return}")
+    print(f"Instructions: {syscall.dstr()}")
+    print()
+```
+
+### Filtering Gadgets
+
+```python
+# Find all pop rax gadgets
+pop_rax = [g for g in rop.rop_gadgets 
+           if 'rax' in g.reg_pops]
+
+# Find all self-contained gadgets
+self_contained = [g for g in rop.rop_gadgets 
+                  if g.self_contained]
+
+# Find gadgets that write to memory
+mem_writers = [g for g in rop.rop_gadgets 
+               if g.mem_writes]
+
+# Find gadgets with specific stack change
+stack_8 = [g for g in rop.rop_gadgets 
+           if g.stack_change == 0x8]
+```
+
+### Detailed Gadget Information
+
+```python
+gadget = rop.rop_gadgets[0]
+
+# Print full details
+print(str(gadget))
+
+# Or just pretty-print the disassembly
+gadget.pp()
+
+# Check specific properties
+if gadget.transit_type == 'pop_pc':
+    print(f"PC offset: {gadget.pc_offset}")
+    print(f"Popped registers: {list(gadget.reg_pops.keys())}")
+
+if gadget.reg_moves:
+    for move in gadget.reg_moves:
+        print(f"Move: {move.from_reg} -> {move.to_reg} ({move.bits} bits)")
+```

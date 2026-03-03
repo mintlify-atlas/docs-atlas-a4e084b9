@@ -1,0 +1,352 @@
+---
+title: Register Operations
+description: Set and move register values using angrop's register manipulation methods
+---
+
+Register operations are fundamental to ROP chain building. Angrop provides powerful methods to set registers to specific values and move data between registers.
+
+## Setting Registers: `set_regs()`
+
+The `set_regs()` method sets one or more registers to specific values.
+
+### Method Signature
+
+```python
+rop.set_regs(**registers, preserve_regs=None)
+```
+
+**Parameters:**
+- `**registers`: Keyword arguments mapping register names to values (integers or symbolic values)
+- `preserve_regs`: Set of register names that should not be modified during chain generation
+
+**Returns:** A `RopChain` object that sets the specified registers
+
+### Basic Examples
+
+<Steps>
+  <Step title="Set a single register">
+    ```python
+    import angr
+    import angrop
+
+    proj = angr.Project("/bin/bash")
+    rop = proj.analyses.ROP()
+    rop.find_gadgets()
+
+    # Set rax to 0x1337
+    chain = rop.set_regs(rax=0x1337)
+    chain.pp()
+    ```
+
+    Output:
+    ```
+    0x0000000000410b23: pop rax; ret 
+                        0x1337
+    ```
+  </Step>
+
+  <Step title="Set multiple registers">
+    ```python
+    # Set multiple registers at once
+    chain = rop.set_regs(rax=0x1337, rbx=0x56565656, rcx=0x42424242)
+    chain.pp()
+    ```
+
+    Output:
+    ```
+    0x0000000000410b23: pop rax; ret 
+                        0x1337
+    0x0000000000404dc0: pop rbx; ret 
+                        0x56565656
+    0x0000000000034573: pop rcx; ret 
+                        0x42424242
+    ```
+  </Step>
+</Steps>
+
+<Note>
+Angrop automatically finds the best gadgets to set your registers, preferring gadgets with minimal stack changes and side effects.
+</Note>
+
+## Preserving Register Values
+
+Use `preserve_regs` to ensure certain registers aren't modified during chain generation:
+
+```python
+# Set rax without modifying rbx
+chain = rop.set_regs(rax=0x1337, preserve_regs={'rbx'})
+
+# Useful when chaining operations
+chain = rop.set_regs(rax=0x1337)
+chain += rop.set_regs(rbx=0x4141, preserve_regs={'rax'})
+# rax is still 0x1337 after the second operation
+```
+
+### Real-World Example: Preserving Function Arguments
+
+This example from angrop's kernel test suite shows preserving registers across function calls:
+
+```python
+import angr
+import angrop
+
+proj = angr.Project("./vmlinux_sym")
+rop = proj.analyses.ROP(kernel_mode=True)
+rop.find_gadgets()
+
+init_cred = 0xffffffff8368b220
+init_nsproxy = 0xffffffff8368ad00
+
+# Step 1: Call function, return value goes to rax
+chain = rop.func_call("find_task_by_vpid", [1])
+
+# Step 2: Move return value to rdi
+chain += rop.move_regs(rdi='rax')
+
+# Step 3: Set rsi while preserving rdi
+chain += rop.set_regs(rsi=init_nsproxy, preserve_regs={'rdi'})
+
+# Step 4: Call function with both preserved registers
+chain += rop.func_call("switch_task_namespaces", [], 
+                       preserve_regs={'rdi', 'rsi'})
+```
+
+<Tip>
+Always use `preserve_regs` when you need to maintain register values across multiple operations, especially when passing return values or setting up complex function arguments.
+</Tip>
+
+## Moving Registers: `move_regs()`
+
+The `move_regs()` method copies data from one register to another.
+
+### Method Signature
+
+```python
+rop.move_regs(**moves, preserve_regs=None)
+```
+
+**Parameters:**
+- `**moves`: Keyword arguments mapping destination register to source register name (as string)
+- `preserve_regs`: Set of register names that should not be modified
+
+**Returns:** A `RopChain` object that performs the register moves
+
+### Basic Examples
+
+```python
+import angr
+import angrop
+
+proj = angr.Project("/bin/bash")
+rop = proj.analyses.ROP()
+rop.find_gadgets()
+
+# Move rdx to rax
+chain = rop.move_regs(rax='rdx')
+chain.pp()
+```
+
+Output:
+```
+0x000000000004a1dd: mov rax, rdx; ret 
+```
+
+### Moving Multiple Registers
+
+```python
+# Move multiple registers in one chain
+chain = rop.move_regs(rax='rdx', rbx='rcx')
+```
+
+<Note>
+Angrop searches for direct move gadgets like `mov rax, rdx; ret`. If direct moves aren't available, it may chain multiple gadgets or use push/pop sequences to accomplish the move.
+</Note>
+
+## Advanced Register Operations
+
+### Using Return Values from Functions
+
+When calling functions, the return value is typically in `rax` (on x64) or `eax` (on x86). Use `move_regs()` to preserve it:
+
+```python
+# Call function that returns a value
+chain = rop.func_call("find_task_by_vpid", [1])
+
+# Move return value from rax to rdi for next call
+chain += rop.move_regs(rdi='rax')
+
+# Use the value as an argument
+chain += rop.func_call("some_function", [], preserve_regs={'rdi'})
+```
+
+### Combining Set and Move Operations
+
+```python
+# Set initial values
+chain = rop.set_regs(rax=0x1000, rbx=0x2000)
+
+# Copy rax to rcx
+chain += rop.move_regs(rcx='rax')
+
+# Now rax=0x1000, rbx=0x2000, rcx=0x1000
+```
+
+## Architecture-Specific Registers
+
+Angrop supports register operations across different architectures:
+
+### x86_64 Registers
+
+```python
+# 64-bit general purpose registers
+chain = rop.set_regs(
+    rax=0x1, rbx=0x2, rcx=0x3, rdx=0x4,
+    rsi=0x5, rdi=0x6, r8=0x7, r9=0x8
+)
+```
+
+### x86 (32-bit) Registers
+
+```python
+# 32-bit general purpose registers
+chain = rop.set_regs(
+    eax=0x1, ebx=0x2, ecx=0x3, edx=0x4,
+    esi=0x5, edi=0x6
+)
+```
+
+### ARM Registers
+
+```python
+# ARM registers
+chain = rop.set_regs(
+    r0=0x1, r1=0x2, r2=0x3, r3=0x4,
+    r4=0x5, r5=0x6
+)
+```
+
+## Register Setting with Badbytes
+
+When badbytes are configured, angrop automatically avoids values containing them:
+
+```python
+import angr
+import angrop
+
+proj = angr.Project("/bin/bash")
+rop = proj.analyses.ROP()
+
+# Set badbytes (e.g., null bytes and newlines)
+rop.set_badbytes([0x00, 0x0a])
+
+rop.find_gadgets()
+
+# Angrop will craft chains avoiding these bytes
+chain = rop.set_regs(rax=0x0a0a0a0a)  # Contains badbyte 0x0a
+```
+
+<Note>
+When values contain badbytes, angrop uses arithmetic operations to construct them. For example, it might set a register to `0x0a0a0a0b` and then subtract 1, rather than directly loading `0x0a0a0a0a`.
+</Note>
+
+## How Register Setting Works Internally
+
+Angrop uses several strategies to set registers:
+
+1. **Direct pop gadgets** - `pop rax; ret` - Most efficient
+2. **Register arithmetic** - If value contains badbytes, construct it via add/sub/xor
+3. **Register moves** - Chain register moves when direct pops aren't available
+4. **Complex gadget chains** - Combine multiple gadgets when needed
+
+### Example: Register Arithmetic for Badbytes
+
+From the source code (`reg_setter.py:699-725`):
+
+```python
+# When a value contains badbytes, angrop finds gadget chains like:
+# 1. Set register to a safe value (e.g., 0x41414141)
+# 2. Add/subtract to reach target (e.g., add 0x12345678)
+# Result: target value without badbytes in the chain
+```
+
+## Symbolic Register Values
+
+You can also set registers to symbolic values for advanced use cases:
+
+```python
+import claripy
+
+# Create a symbolic value
+sym_val = claripy.BVS("my_value", 64)
+
+# Set register to symbolic value
+chain = rop.set_regs(rax=sym_val)
+
+# The solver will find concrete values during chain generation
+```
+
+## Troubleshooting
+
+### "Couldn't set registers" Error
+
+If you see this error, it means angrop couldn't find gadgets to set the requested registers:
+
+```python
+from angrop.errors import RopException
+
+try:
+    chain = rop.set_regs(r15=0x1337)
+except RopException as e:
+    print(f"Failed: {e}")
+    # Try alternatives:
+    # 1. Run find_gadgets with optimize=True
+    # 2. Check if the register is actually available
+    # 3. Use register moves instead
+```
+
+<Tip>
+**Solutions:**
+- Ensure `find_gadgets(optimize=True)` was called
+- Try using `move_regs()` from a register that can be set
+- Check if your badbytes are too restrictive
+- Verify the register name is correct for your architecture
+</Tip>
+
+## Best Practices
+
+1. **Minimize register operations** - Set multiple registers in one call when possible
+2. **Use preserve_regs strategically** - Only preserve registers when necessary
+3. **Chain efficiently** - Combine operations with `+` instead of making separate calls
+4. **Verify your chains** - Use `chain.pp()` to inspect the generated gadgets
+
+## Examples from Different Architectures
+
+### x86_64 Function Call Setup
+
+```python
+# Set up arguments for a function call
+# Calling convention: rdi, rsi, rdx, rcx, r8, r9, then stack
+chain = rop.set_regs(
+    rdi=0x400000,  # arg1
+    rsi=0x100,     # arg2
+    rdx=0x0        # arg3
+)
+chain += rop.func_call("read", [])  # Uses preserved registers
+```
+
+### ARM Function Call Setup
+
+```python
+# ARM calling convention: r0-r3 for first 4 args
+chain = rop.set_regs(
+    r0=0x400000,  # arg1
+    r1=0x100,     # arg2
+    r2=0x0        # arg3
+)
+```
+
+## Next Steps
+
+- [Memory Operations](/guides/memory-operations) - Writing and modifying memory
+- [Function Calls](/guides/function-calls) - Using registers for function arguments
+- [Syscalls](/guides/syscalls) - Setting up syscall arguments

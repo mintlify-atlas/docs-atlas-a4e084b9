@@ -1,0 +1,245 @@
+---
+title: Finding Gadgets
+description: Learn how to discover ROP gadgets in binaries using angrop's analysis methods
+---
+
+Angrop provides powerful methods to find and analyze ROP gadgets in binaries. This guide covers the different approaches to gadget discovery and caching.
+
+## Overview
+
+After initializing a ROP analysis, you need to find gadgets before you can build chains. Angrop offers three main approaches:
+
+1. **Multithreaded search** - Fast gadget discovery using multiple processes
+2. **Single-threaded search** - Useful for performance evaluation and debugging
+3. **Load from cache** - Reuse previously discovered gadgets
+
+## Finding Gadgets with Multiprocessing
+
+The `find_gadgets()` method searches for gadgets using multiple processes for optimal performance.
+
+### Method Signature
+
+```python
+rop.find_gadgets(optimize=True, **kwargs)
+```
+
+**Parameters:**
+- `optimize` (bool): Whether to run `chain_builder.optimize()` after finding gadgets. This may take time but makes the chain builder more powerful. Default is `True`.
+- `processes` (int): Number of processes to use for multiprocessing. Default is `4`.
+- `show_progress` (bool): Whether to display a progress bar. Default is `True`.
+
+### Example Usage
+
+<Steps>
+  <Step title="Initialize the ROP analysis">
+    ```python
+    import angr
+    import angrop
+
+    proj = angr.Project("/bin/bash")
+    rop = proj.analyses.ROP()
+    ```
+  </Step>
+
+  <Step title="Find gadgets with default settings">
+    ```python
+    # Find gadgets using 4 processes with optimization
+    rop.find_gadgets()
+    
+    print(f"Found {len(rop.rop_gadgets)} ROP gadgets")
+    print(f"Found {len(rop.syscall_gadgets)} syscall gadgets")
+    print(f"Found {len(rop.pivot_gadgets)} pivot gadgets")
+    ```
+  </Step>
+
+  <Step title="Customize the search parameters">
+    ```python
+    # Use more processes for faster discovery
+    rop.find_gadgets(processes=16, show_progress=True)
+    
+    # Skip optimization to save time
+    rop.find_gadgets(optimize=False)
+    ```
+  </Step>
+</Steps>
+
+<Note>
+The `optimize` parameter runs graph optimization algorithms that discover additional ROP capabilities by chaining gadgets together. While this increases setup time, it significantly improves chain generation success rates.
+</Note>
+
+## Finding Gadgets Single-Threaded
+
+The `find_gadgets_single_threaded()` method is useful for performance evaluation and debugging.
+
+### Method Signature
+
+```python
+rop.find_gadgets_single_threaded(show_progress=True, optimize=True)
+```
+
+**Parameters:**
+- `show_progress` (bool): Whether to display a progress bar. Default is `True`.
+- `optimize` (bool): Whether to run optimization. Default is `True`.
+
+### Example Usage
+
+```python
+import time
+import angr
+import angrop
+
+proj = angr.Project("./binary")
+rop = proj.analyses.ROP()
+
+# Measure gadget finding performance
+start = time.time()
+rop.find_gadgets_single_threaded()
+print(f"Gadget finding time: {time.time() - start:.2f}s")
+```
+
+<Tip>
+Use single-threaded mode when you need reproducible results or want to profile the gadget discovery process.
+</Tip>
+
+## Saving and Loading Gadgets
+
+For large binaries, gadget discovery can take significant time. Angrop supports caching gadgets to disk.
+
+### Saving Gadgets
+
+```python
+rop.save_gadgets(path)
+```
+
+**Parameters:**
+- `path` (str): File path where gadgets will be stored using pickle format.
+
+### Loading Gadgets
+
+```python
+rop.load_gadgets(path, optimize=True)
+```
+
+**Parameters:**
+- `path` (str): File path from which to load gadgets.
+- `optimize` (bool): Whether to run optimization after loading. Default is `True`.
+
+### Example: Cache-First Workflow
+
+```python
+import os
+import angr
+import angrop
+
+proj = angr.Project("./vmlinux_sym")
+rop = proj.analyses.ROP(kernel_mode=True)
+
+cache_file = "/tmp/gadget_cache"
+
+if os.path.exists(cache_file):
+    # Load from cache if available
+    rop.load_gadgets(cache_file)
+    print("Loaded gadgets from cache")
+else:
+    # Find and save gadgets
+    rop.find_gadgets(processes=16)
+    rop.save_gadgets(cache_file)
+    print("Saved gadgets to cache")
+
+# Now you can build chains
+chain = rop.set_regs(rax=0x1337)
+```
+
+<Note>
+The cache files are specific to the binary and configuration parameters. If you change `ROP()` initialization parameters (like `kernel_mode`, `fast_mode`, etc.), you should regenerate the cache.
+</Note>
+
+## Real-World Example: Linux Kernel Gadgets
+
+This example from angrop's test suite shows a complete workflow for finding gadgets in the Linux kernel:
+
+```python
+import os
+import time
+from multiprocessing import cpu_count
+import angr
+import angrop
+
+# Load Linux kernel binary
+proj = angr.Project("./vmlinux_sym")
+rop = proj.analyses.ROP(
+    fast_mode=False,
+    only_check_near_rets=False,
+    max_block_size=12,
+    kernel_mode=True
+)
+
+cpu_num = cpu_count()
+cache = "/tmp/linux_gadget_cache"
+
+# Find or load gadgets
+start = time.time()
+if os.path.exists(cache):
+    rop.load_gadgets(cache, optimize=False)
+else:
+    rop.find_gadgets(processes=cpu_num, optimize=False)
+    rop.save_gadgets(cache)
+print(f"Gadget finding time: {time.time() - start}s")
+
+# Run optimization separately
+start = time.time()
+rop.optimize(processes=cpu_num)
+print(f"Graph optimization time: {time.time() - start}s")
+
+# Build chains
+chain = rop.func_call("commit_creds", [0xffffffff8368b220])
+```
+
+## What Happens During Gadget Finding
+
+When you call `find_gadgets()` or `find_gadgets_single_threaded()`, angrop:
+
+1. **Identifies potential gadget locations** - Scans for return instructions and nearby code
+2. **Analyzes each gadget** - Symbolically executes instruction sequences to determine their effects
+3. **Categorizes gadgets** - Sorts them into:
+   - `rop_gadgets` - General-purpose ROP gadgets (pop, mov, arithmetic, etc.)
+   - `syscall_gadgets` - Gadgets ending in syscall/int 0x80
+   - `pivot_gadgets` - Stack pivoting gadgets
+4. **Filters by badbytes** - Removes gadgets whose addresses contain badbytes (if configured)
+5. **Optimizes chains** (if enabled) - Discovers complex multi-gadget capabilities
+
+## Analyzing Found Gadgets
+
+After finding gadgets, you can inspect what was discovered:
+
+```python
+# View gadget counts
+print(f"ROP gadgets: {len(rop.rop_gadgets)}")
+print(f"Syscall gadgets: {len(rop.syscall_gadgets)}")
+print(f"Pivot gadgets: {len(rop.pivot_gadgets)}")
+
+# Examine individual gadgets
+for gadget in rop.rop_gadgets[:5]:
+    print(f"Address: {hex(gadget.addr)}")
+    print(f"Popped registers: {gadget.popped_regs}")
+    print(f"Changed registers: {gadget.changed_regs}")
+    print(f"Stack change: {gadget.stack_change}")
+    print()
+```
+
+## Performance Tips
+
+<Tip>
+**For large binaries:**
+- Use `fast_mode=True` to skip complex gadgets
+- Increase `processes` to match your CPU core count
+- Set `optimize=False` during initial discovery, then run `rop.optimize()` separately
+- Always cache gadgets with `save_gadgets()` for reuse
+</Tip>
+
+<Tip>
+**For kernel binaries:**
+- Set `kernel_mode=True`
+- Use `only_check_near_rets=False` to find more gadgets
+- Increase `max_block_size` if needed (default varies by architecture)
+</Tip>

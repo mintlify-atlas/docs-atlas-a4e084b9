@@ -1,0 +1,556 @@
+---
+title: Chain Optimization
+description: Understand angrop's optimization process for generating efficient ROP chains
+---
+
+Angrop includes a sophisticated optimization system that discovers advanced gadget combinations and enables complex ROP chain generation. This guide explains how optimization works and when to use it.
+
+## What is Optimization?
+
+After finding gadgets, angrop can run an optimization phase that:
+
+1. **Discovers multi-gadget capabilities** - Combines simple gadgets to create complex operations
+2. **Normalizes non-self-contained gadgets** - Makes advanced gadgets usable
+3. **Builds register move graphs** - Finds efficient paths to move data between registers
+4. **Enables harder chains** - Makes previously impossible chains possible
+
+<Note>
+Optimization is enabled by default when calling `find_gadgets(optimize=True)`. For large binaries, optimization can take significant time but dramatically improves chain generation success rates.
+</Note>
+
+## The `optimize` Parameter
+
+The `optimize` parameter controls whether optimization runs after gadget finding.
+
+### In `find_gadgets()`
+
+```python
+import angr
+import angrop
+
+proj = angr.Project("/bin/bash")
+rop = proj.analyses.ROP()
+
+# Optimization enabled (default)
+rop.find_gadgets(optimize=True)
+
+# Optimization disabled (faster, but less capable)
+rop.find_gadgets(optimize=False)
+```
+
+### In `find_gadgets_single_threaded()`
+
+```python
+# Single-threaded mode also supports optimize parameter
+rop.find_gadgets_single_threaded(optimize=True)
+```
+
+### In `load_gadgets()`
+
+```python
+# When loading cached gadgets, you can optimize separately
+rop.load_gadgets("/tmp/gadgets.cache", optimize=True)
+
+# Or load without optimizing and optimize later
+rop.load_gadgets("/tmp/gadgets.cache", optimize=False)
+rop.optimize(processes=4)  # Run optimization manually
+```
+
+## Manual Optimization
+
+You can run optimization separately for better control:
+
+```python
+import time
+import angr
+import angrop
+from multiprocessing import cpu_count
+
+proj = angr.Project("/bin/bash")
+rop = proj.analyses.ROP()
+
+# Find gadgets without optimization
+start = time.time()
+rop.find_gadgets(optimize=False)
+print(f"Gadget finding: {time.time() - start:.2f}s")
+
+# Run optimization separately
+start = time.time()
+rop.optimize(processes=cpu_count())
+print(f"Optimization: {time.time() - start:.2f}s")
+```
+
+### Method Signature
+
+```python
+rop.optimize(processes=4)
+```
+
+**Parameters:**
+- `processes`: Number of processes to use for parallel optimization (default: 4)
+
+## Real-World Example: Linux Kernel
+
+From angrop's kernel test suite (`examples/linux_escape_chain/solve.py`):
+
+```python
+import os
+import time
+from multiprocessing import cpu_count
+import angr
+import angrop
+
+proj = angr.Project("./vmlinux_sym")
+rop = proj.analyses.ROP(
+    fast_mode=False,
+    only_check_near_rets=False,
+    max_block_size=12,
+    kernel_mode=True
+)
+
+cpu_num = cpu_count()
+cache = "/tmp/linux_gadget_cache"
+
+# Phase 1: Find gadgets (404 seconds on 16-core machine)
+start = time.time()
+if os.path.exists(cache):
+    rop.load_gadgets(cache, optimize=False)
+else:
+    rop.find_gadgets(processes=cpu_num, optimize=False)
+    rop.save_gadgets(cache)
+print(f"Gadget finding time: {time.time() - start}s")
+
+# Phase 2: Optimize (10 seconds on 16-core machine)
+start = time.time()
+rop.optimize(processes=cpu_num)
+print(f"Graph optimization time: {time.time() - start}s")
+
+# Phase 3: Generate chain (0.7 seconds)
+start = time.time()
+chain = rop.func_call("commit_creds", [0xffffffff8368b220])
+print(f"Chain generation time: {time.time() - start}s")
+```
+
+<Tip>
+For large binaries (especially kernels), separating optimization from gadget finding provides better progress visibility and allows you to cache gadgets without optimization, then optimize as needed.
+</Tip>
+
+## What Happens During Optimization
+
+Angrop runs several optimization passes:
+
+### 1. Register Mover Optimization
+
+From the source code (`reg_mover.py:302-343`), angrop:
+
+<Steps>
+  <Step title="Build register move graph">
+    Creates a directed graph where:
+    - Nodes are registers
+    - Edges are possible register moves
+    - Edge weights are gadget efficiency (stack change, etc.)
+  </Step>
+
+  <Step title="Normalize complex gadgets">
+    Converts non-self-contained gadgets into usable register moves:
+    ```python
+    # Example: gadget does "mov rax, rbx; jmp rcx"
+    # Optimization normalizes it to set rcx properly
+    # Result: usable "rax = rbx" move
+    ```
+  </Step>
+
+  <Step title="Find push/pop move chains">
+    Discovers register moves via push/pop sequences:
+    ```python
+    # Chains like:
+    # push rax; pop rdi  => Move rax to rdi
+    # Even if these are separate gadgets!
+    ```
+  </Step>
+</Steps>
+
+### 2. Register Setter Optimization  
+
+From the source code (`reg_setter.py:432-448`), angrop:
+
+<Steps>
+  <Step title="Optimize with register moves">
+    Uses the register move graph to discover new ways to set registers:
+    ```python
+    # If we can set rax and move rax→rbx:
+    # Now we can set rbx (even without direct pop rbx)
+    ```
+  </Step>
+
+  <Step title="Optimize with complex gadgets">
+    Normalizes gadgets that:
+    - Require setup (non-self-contained)
+    - Have symbolic memory accesses
+    - Use conditional branches
+    
+    Makes them usable by building setup chains automatically.
+  </Step>
+</Steps>
+
+### 3. Graph Reduction
+
+From the source code (`reg_setter.py:451-473`), angrop:
+
+- Limits gadgets per edge to top 5 (by efficiency)
+- Builds a "giga graph" for constraint solving
+- Optimizes gadget selection for minimal overhead
+
+## Benefits of Optimization
+
+### Before Optimization
+
+```python
+import angr
+import angrop
+
+proj = angr.Project("/bin/bash")
+rop = proj.analyses.ROP()
+rop.find_gadgets(optimize=False)
+
+# May fail on complex chains
+try:
+    chain = rop.move_regs(r15='rax')  # No direct move gadget
+except angrop.errors.RopException:
+    print("Failed: can't move rax to r15")
+```
+
+### After Optimization
+
+```python
+proj = angr.Project("/bin/bash")
+rop = proj.analyses.ROP()
+rop.find_gadgets(optimize=True)
+
+# Now succeeds by chaining gadgets
+chain = rop.move_regs(r15='rax')
+# Might generate: rax→rbx→r15 using multiple gadgets
+chain.pp()
+```
+
+## Performance Characteristics
+
+### Small Binaries (< 1MB)
+
+```python
+import time
+import angr
+import angrop
+
+proj = angr.Project("/bin/ls")  # ~140KB
+rop = proj.analyses.ROP()
+
+start = time.time()
+rop.find_gadgets(optimize=True)
+print(f"Total time: {time.time() - start:.2f}s")
+# Typical: 5-15 seconds including optimization
+```
+
+### Medium Binaries (1-10MB)
+
+```python
+proj = angr.Project("/bin/bash")  # ~1.2MB
+rop = proj.analyses.ROP()
+
+start = time.time()
+rop.find_gadgets(processes=16, optimize=True)
+print(f"Total time: {time.time() - start:.2f}s")
+# Typical: 30-120 seconds including optimization
+```
+
+### Large Binaries (> 10MB)
+
+```python
+proj = angr.Project("./vmlinux_sym")  # ~60MB kernel
+rop = proj.analyses.ROP(kernel_mode=True)
+
+start = time.time()
+rop.find_gadgets(processes=16, optimize=False)
+print(f"Finding: {time.time() - start:.2f}s")
+# Typical: 400-1000 seconds
+
+start = time.time()
+rop.optimize(processes=16)
+print(f"Optimizing: {time.time() - start:.2f}s")
+# Typical: 10-30 seconds
+```
+
+<Note>
+Optimization time is proportional to:
+- Number of gadgets found
+- Number of registers in architecture
+- Complexity of gadget relationships
+- Number of CPU cores available
+</Note>
+
+## Optimization Strategies
+
+### Strategy 1: Always Optimize for Production
+
+```python
+# For actual exploits, always optimize
+rop.find_gadgets(optimize=True)
+```
+
+**Why:** Maximizes chain generation success rate
+
+### Strategy 2: Skip for Quick Testing
+
+```python
+# During development, skip optimization for speed
+rop.find_gadgets(optimize=False)
+
+# Test basic chains
+chain = rop.set_regs(rax=0x1234)  # Simple chains still work
+```
+
+**Why:** Faster iteration during development
+
+### Strategy 3: Separate Phases for Large Binaries
+
+```python
+# Cache gadgets without optimization
+if not os.path.exists(cache):
+    rop.find_gadgets(processes=16, optimize=False)
+    rop.save_gadgets(cache)
+
+# Load and optimize when needed
+rop.load_gadgets(cache, optimize=False)
+if need_complex_chains:
+    rop.optimize(processes=16)
+```
+
+**Why:** Better control and caching for slow gadget finding
+
+### Strategy 4: Incremental Optimization
+
+```python
+# Start without optimization
+rop.find_gadgets(optimize=False)
+
+# Try building chain
+try:
+    chain = rop.move_regs(r15='rax')
+except angrop.errors.RopException:
+    # Failed, try with optimization
+    print("Optimizing...")
+    rop.optimize()
+    chain = rop.move_regs(r15='rax')
+```
+
+**Why:** Only pay optimization cost when necessary
+
+## Advanced: Understanding Optimization Internals
+
+### Normalization Process
+
+From the source code (`builder.py`), "normalization" means:
+
+1. **Identify dependencies** - What registers/memory does gadget need?
+2. **Build setup chain** - Generate chain to satisfy dependencies
+3. **Combine gadget with setup** - Create self-contained "RopBlock"
+4. **Cache result** - Reuse normalized gadget in future chains
+
+Example:
+```python
+# Gadget: mov [rax], rbx; jmp rcx
+# Dependencies: rax (address), rbx (data), rcx (return)
+
+# Normalization creates:
+# 1. Chain to set rax, rbx
+# 2. Chain to set rcx to "ret" gadget
+# 3. Combined chain that acts like: mov [rax], rbx; ret
+```
+
+### Register Move Graph
+
+From the source code (`reg_mover.py:345-361`):
+
+```python
+# Pseudocode of register move graph
+graph = {
+    'rax': {
+        'rbx': [gadget1, gadget2],  # rax→rbx moves
+        'rcx': [gadget3],            # rax→rcx moves
+    },
+    'rbx': {
+        'rdx': [gadget4],            # rbx→rdx moves
+    },
+    # ...
+}
+
+# Optimization finds paths:
+# rax→rbx→rdx (two gadgets)
+# Enables: rop.move_regs(rdx='rax')
+```
+
+### Constraint-Based Gadget Selection
+
+Angrop uses constraint solving to find optimal gadget combinations:
+
+```python
+# When building chains, angrop:
+# 1. Identifies all possible gadget sequences
+# 2. Encodes constraints (preserve registers, avoid badbytes, etc.)
+# 3. Solves for shortest/most efficient sequence
+# 4. Verifies chain via symbolic execution
+```
+
+## Optimization and Badbytes
+
+Optimization respects badbyte restrictions:
+
+```python
+import angr
+import angrop
+
+proj = angr.Project("/bin/bash")
+rop = proj.analyses.ROP()
+rop.set_badbytes([0x00, 0x0a])
+
+# Optimization only uses gadgets at safe addresses
+rop.find_gadgets(optimize=True)
+
+# Generated chains avoid badbytes
+chain = rop.set_regs(rax=0x0a0a0a0a)  # Badbyte in value
+# Optimization enables arithmetic construction
+```
+
+## Disabling Optimization for Speed
+
+When you don't need complex chains:
+
+```python
+import angr
+import angrop
+
+# Fast mode: skip optimization
+proj = angr.Project("/bin/bash")
+rop = proj.analyses.ROP(fast_mode=True)
+rop.find_gadgets(optimize=False)
+
+# Basic operations still work
+chain = rop.set_regs(rax=0x1234, rbx=0x5678)
+chain += rop.func_call("system", [0x61b100])
+
+# Complex operations may fail
+try:
+    chain = rop.move_regs(r15='rax')  # Might not work
+except angrop.errors.RopException:
+    print("Optimization needed for this operation")
+```
+
+## Troubleshooting Optimization
+
+### Long Optimization Times
+
+```python
+import time
+import angr
+import angrop
+
+proj = angr.Project("./large_binary")
+rop = proj.analyses.ROP()
+
+start = time.time()
+rop.find_gadgets(processes=16, optimize=False)
+print(f"Found {len(rop.rop_gadgets)} gadgets in {time.time()-start:.1f}s")
+
+if len(rop.rop_gadgets) > 10000:
+    print("WARNING: Many gadgets, optimization will be slow")
+    # Consider:
+    # 1. Using fast_mode=True
+    # 2. Restricting gadget search
+    # 3. Running optimization overnight
+
+start = time.time()
+rop.optimize(processes=16)
+print(f"Optimized in {time.time()-start:.1f}s")
+```
+
+<Tip>
+**To speed up optimization:**
+- Use more CPU cores (`processes=cpu_count()`)
+- Enable `fast_mode=True` to find fewer gadgets
+- Set stricter badbytes to eliminate gadgets early
+- Cache optimized gadgets for reuse
+</Tip>
+
+### Optimization Failures
+
+Optimization can fail to run in some cases:
+
+```python
+import angr
+import angrop
+
+proj = angr.Project("/bin/bash")
+rop = proj.analyses.ROP()
+rop.find_gadgets(optimize=False)
+
+if len(rop.rop_gadgets) < 10:
+    print("Too few gadgets for meaningful optimization")
+    # Optimization won't help much
+else:
+    rop.optimize()
+```
+
+## Best Practices
+
+1. **Always optimize for production exploits** - Maximizes success rate
+2. **Cache gadgets with optimization** - Save time on repeated use
+3. **Use parallel optimization** - Set `processes=cpu_count()`
+4. **Separate phases for large binaries** - Better progress tracking
+5. **Profile your workflow** - Measure time spent in each phase
+6. **Skip optimization during development** - Faster iteration
+
+## Measuring Optimization Impact
+
+```python
+import angr
+import angrop
+
+proj = angr.Project("/bin/bash")
+
+# Test without optimization
+rop_no_opt = proj.analyses.ROP()
+rop_no_opt.find_gadgets(optimize=False)
+
+# Test with optimization  
+rop_opt = proj.analyses.ROP()
+rop_opt.find_gadgets(optimize=True)
+
+# Compare capabilities
+test_cases = [
+    ("set_regs", lambda r: r.set_regs(rax=0x1234)),
+    ("move_regs", lambda r: r.move_regs(r15='rax')),
+    ("func_call", lambda r: r.func_call("system", [0x61b100])),
+]
+
+for name, test in test_cases:
+    without_opt = True
+    with_opt = True
+    
+    try:
+        test(rop_no_opt)
+    except:
+        without_opt = False
+    
+    try:
+        test(rop_opt)
+    except:
+        with_opt = False
+    
+    print(f"{name}: without_opt={without_opt}, with_opt={with_opt}")
+```
+
+## Next Steps
+
+- [Finding Gadgets](/guides/finding-gadgets) - Configure gadget discovery for optimization
+- [Building Chains](/guides/building-chains) - Use optimized gadgets in complex chains
+- [Badbytes](/guides/badbytes) - Understand optimization with byte restrictions

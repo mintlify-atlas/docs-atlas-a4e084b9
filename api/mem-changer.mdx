@@ -1,0 +1,499 @@
+---
+title: MemChanger
+description: Memory arithmetic chain builder for modifying memory using arithmetic and logical operations
+---
+
+The `MemChanger` class builds ROP chains that perform arithmetic and logical operations directly on memory locations. It supports add, xor, or, and operations.
+
+## Overview
+
+Accessed through the ROP instance as `rop.mem_add()`, `rop.mem_xor()`, `rop.mem_or()`, and `rop.mem_and()`, MemChanger automatically:
+- Finds gadgets that operate on memory
+- Handles different data sizes (1, 2, 4, 8 bytes)
+- Verifies operations are correct
+- Manages register dependencies
+
+## Class Definition
+
+```python
+class MemChanger(Builder)
+```
+
+Located in `angrop/chain_builder/mem_changer.py`
+
+## Public Methods
+
+### mem_add
+
+```python
+mem_add(addr, value, size=None) -> RopChain
+```
+
+Add a value to data at a memory location.
+
+<ParamField path="addr" type="int | RopValue" required>
+  Memory address to modify.
+</ParamField>
+
+<ParamField path="value" type="int | RopValue" required>
+  Value to add.
+</ParamField>
+
+<ParamField path="size" type="int | None" default="None">
+  Number of bytes to operate on (1, 2, 4, or 8). Defaults to architecture word size.
+</ParamField>
+
+**Returns:** A `RopChain` that performs the addition.
+
+### mem_xor
+
+```python
+mem_xor(addr, value, size=None) -> RopChain
+```
+
+XOR data at a memory location with a value.
+
+<ParamField path="addr" type="int | RopValue" required>
+  Memory address to modify.
+</ParamField>
+
+<ParamField path="value" type="int | RopValue" required>
+  Value to XOR with.
+</ParamField>
+
+<ParamField path="size" type="int | None" default="None">
+  Number of bytes (1, 2, 4, or 8).
+</ParamField>
+
+**Returns:** A `RopChain` that performs the XOR.
+
+### mem_or
+
+```python
+mem_or(addr, value, size=None) -> RopChain
+```
+
+Perform bitwise OR on data at a memory location.
+
+<ParamField path="addr" type="int | RopValue" required>
+  Memory address to modify.
+</ParamField>
+
+<ParamField path="value" type="int | RopValue" required>
+  Value to OR with.
+</ParamField>
+
+<ParamField path="size" type="int | None" default="None">
+  Number of bytes (1, 2, 4, or 8).
+</ParamField>
+
+**Returns:** A `RopChain` that performs the OR.
+
+### mem_and
+
+```python
+mem_and(addr, value, size=None) -> RopChain
+```
+
+Perform bitwise AND on data at a memory location.
+
+<ParamField path="addr" type="int | RopValue" required>
+  Memory address to modify.
+</ParamField>
+
+<ParamField path="value" type="int | RopValue" required>
+  Value to AND with.
+</ParamField>
+
+<ParamField path="size" type="int | None" default="None">
+  Number of bytes (1, 2, 4, or 8).
+</ParamField>
+
+**Returns:** A `RopChain` that performs the AND.
+
+### verify
+
+```python
+verify(op, chain, addr, value, data_size) -> None
+```
+
+Verifies that a memory operation chain works correctly.
+
+<ParamField path="op" type="str" required>
+  Operation name: 'add', 'xor', 'or', or 'and'.
+</ParamField>
+
+<ParamField path="chain" type="RopChain" required>
+  Chain to verify.
+</ParamField>
+
+<ParamField path="addr" type="RopValue" required>
+  Memory address.
+</ParamField>
+
+<ParamField path="value" type="RopValue" required>
+  Operation value.
+</ParamField>
+
+<ParamField path="data_size" type="int" required>
+  Data size in bits (8, 16, 32, or 64).
+</ParamField>
+
+**Raises:** `RopException` if verification fails.
+
+## ROP Instance Methods
+
+```python
+rop.mem_add(addr, value, size=None)
+rop.mem_xor(addr, value, size=None)
+rop.mem_or(addr, value, size=None)
+rop.mem_and(addr, value, size=None)
+```
+
+## Implementation Details
+
+### Memory Change Gadgets
+
+MemChanger requires gadgets with specific properties:
+
+1. **Self-contained**: No dependencies on initial state
+2. **Single memory change**: Only one read-modify-write operation
+3. **Independent addr/data**: Address and data controlled separately
+
+From source code (mem_changer.py:87-100):
+
+```python
+def _get_all_mem_change_gadgets(gadgets):
+    possible_gadgets = set()
+    for g in gadgets:
+        if not g.self_contained:
+            continue
+        if len(g.mem_changes) != 1:
+            continue
+        for m_access in g.mem_changes:
+            if (m_access.addr_controllable() and 
+                m_access.data_controllable() and 
+                m_access.addr_data_independent()):
+                possible_gadgets.add(g)
+    return possible_gadgets
+```
+
+### Gadget Examples
+
+```asm
+; Good memory change gadgets
+add dword ptr [rax], ebx; ret    ; ADD operation
+xor qword ptr [rdi], rsi; ret    ; XOR operation
+or byte ptr [rcx], dl; ret       ; OR operation
+and word ptr [r8], r9w; ret      ; AND operation
+
+; Also matches:
+add [rax], rbx; ret
+sub [rdi], rsi; ret              ; Treated as ADD
+
+; Bad gadgets
+add [rax], rax; ret              ; addr and data not independent
+add [rax], 0x42; ret             ; data not controllable
+```
+
+### Operation Verification
+
+From source code (mem_changer.py:32-71):
+
+```python
+def verify(self, op, chain, addr, value, data_size):
+    # Write initial test value to memory
+    init_val = 0x4142434445464748 & ((1 << data_size) - 1)
+    chain2._blank_state.memory.store(addr.data, init_val, ...)
+    
+    # Execute chain
+    state = chain2.exec()
+    final_bv = state.memory.load(addr.data, data_bytes)
+    
+    # Verify result
+    match op:
+        case 'add':
+            correct = (init + value) & mask
+        case 'xor':
+            correct = init ^ value
+        case 'or':
+            correct = init | value
+        case 'and':
+            correct = init & value
+    
+    if correct != final:
+        raise RopException("memory change fails")
+```
+
+## Usage Examples
+
+### Memory Addition
+
+```python
+import angr
+import angrop
+
+proj = angr.Project("/bin/bash")
+rop = proj.analyses.ROP()
+rop.find_gadgets()
+
+# Add 0x1000 to value at 0x804f124
+chain = rop.mem_add(0x804f124, 0x1000)
+
+# Add with specific size (4 bytes)
+chain = rop.mem_add(0x804f124, 0x1000, size=4)
+```
+
+### Memory XOR
+
+```python
+# XOR value at 0x804f124 with 0x41414141
+chain = rop.mem_xor(0x804f124, 0x41414141)
+
+# Useful for encoding/decoding data
+encoded_value = 0x12345678
+key = 0xdeadbeef
+chain = rop.write_to_mem(0x61b100, encoded_value.to_bytes(4, 'little'))
+chain += rop.mem_xor(0x61b100, key, size=4)
+# Memory now contains: 0x12345678 ^ 0xdeadbeef
+```
+
+### Memory OR
+
+```python
+# Set specific bits at a memory location
+chain = rop.mem_or(0x804f124, 0x000000ff, size=4)
+
+# Useful for setting flags or enabling bits
+chain = rop.write_to_mem(0x61b100, b"\x00\x00\x00\x00")
+chain += rop.mem_or(0x61b100, 0x80000000, size=4)  # Set MSB
+```
+
+### Memory AND
+
+```python
+# Clear specific bits at a memory location
+chain = rop.mem_and(0x804f124, 0xffffff00, size=4)
+
+# Useful for masking or disabling bits
+chain = rop.write_to_mem(0x61b100, b"\xff\xff\xff\xff")
+chain += rop.mem_and(0x61b100, 0x0000ffff, size=4)  # Keep only lower 16 bits
+```
+
+### Complete Memory Operations Example
+
+```python
+proj = angr.Project("/bin/bash")
+rop = proj.analyses.ROP()
+rop.find_gadgets()
+
+# Write initial value
+chain = rop.write_to_mem(0x804f124, b"\x00\x00\x00\x00")
+
+# Add to memory
+chain += rop.mem_add(0x804f124, 0x41414141)
+
+# XOR to encode
+chain += rop.mem_xor(0x804f124, 0x12345678)
+
+# OR to set flags
+chain += rop.mem_or(0x804f124, 0x80000000)
+
+# AND to mask
+chain += rop.mem_and(0x804f124, 0xffffffff)
+```
+
+### Incrementing a Counter
+
+```python
+# Increment counter in memory
+counter_addr = 0x804f000
+chain = rop.mem_add(counter_addr, 1, size=4)
+```
+
+### Toggling a Flag
+
+```python
+# Toggle flag bit
+flag_addr = 0x804f004
+chain = rop.mem_xor(flag_addr, 1, size=1)
+```
+
+### Enabling/Disabling Bits in Bitmask
+
+```python
+mask_addr = 0x804f008
+
+# Enable specific bits
+chain = rop.mem_or(mask_addr, 0b10101010, size=1)
+
+# Clear specific bits
+chain += rop.mem_and(mask_addr, 0b11110000, size=1)
+```
+
+### Badbyte Avoidance
+
+MemChanger is crucial for writing data with badbytes:
+
+```python
+proj = angr.Project("/bin/bash")
+rop = proj.analyses.ROP()
+rop.set_badbytes([0x00, 0x0a])
+rop.find_gadgets()
+
+# To write 0x0a0a0a0a (contains badbyte):
+# Write 0x0b0b0b0b (safe)
+chain = rop.write_to_mem(0x61b100, b"\x0b\x0b\x0b\x0b")
+
+# Subtract 0x01010101
+chain += rop.mem_add(0x61b100, -0x01010101 & 0xffffffff, size=4)
+# Result: 0x0a0a0a0a without badbytes in chain
+```
+
+## Size Specification
+
+All operations support explicit size:
+
+```python
+# 1 byte (8-bit)
+chain = rop.mem_add(addr, 0xff, size=1)
+
+# 2 bytes (16-bit)
+chain = rop.mem_xor(addr, 0xffff, size=2)
+
+# 4 bytes (32-bit)
+chain = rop.mem_or(addr, 0xffffffff, size=4)
+
+# 8 bytes (64-bit)
+chain = rop.mem_and(addr, 0xffffffffffffffff, size=8)
+```
+
+<Tip>
+If you don't specify `size`, MemChanger uses the architecture's word size (4 bytes for 32-bit, 8 bytes for 64-bit).
+</Tip>
+
+## Effect Tuple
+
+MemChanger filters gadgets based on their effect:
+
+From source code (mem_changer.py:73-81):
+
+```python
+def _effect_tuple(self, g):
+    change = g.mem_changes[0]
+    # add and sub are same class
+    v1 = change.op if change.op not in ('__add__', '__sub__') else '__add__'
+    v2 = change.data_size
+    v3 = change.data_constant
+    v4 = tuple(sorted(change.addr_dependencies))
+    v5 = tuple(sorted(change.data_dependencies))
+    return (v1, v2, v3, v4, v5)
+```
+
+This ensures only unique gadgets are kept.
+
+## Operation-Specific Gadget Lists
+
+MemChanger maintains separate lists:
+
+From source code (mem_changer.py:25-30):
+
+```python
+self._mem_add_gadgets   # ADD and SUB operations
+self._mem_xor_gadgets   # XOR operations
+self._mem_or_gadgets    # OR operations
+self._mem_and_gadgets   # AND operations
+```
+
+## Error Handling
+
+### "Fail to perform _mem_change for {op} operation!"
+
+Raised when no suitable gadgets are found.
+
+**Solutions:**
+1. Use `fast_mode=False` when initializing ROP
+2. Check if binary has memory change gadgets
+3. Try a different operation (XOR instead of ADD)
+
+### "{value} cannot be represented by {size}-byte"
+
+Raised when value is too large for specified size.
+
+**Solution:** Use larger size or split operation:
+```python
+# Instead of:
+chain = rop.mem_add(addr, 0x100000000, size=4)  # Too big!
+
+# Use:
+chain = rop.mem_add(addr, 0xffffffff, size=4)  # Max 32-bit
+```
+
+### "does not support finding raw chain that {op} {size} bytes"
+
+Raised when size is invalid.
+
+**Solution:** Use valid sizes: 1, 2, 4, or 8 bytes.
+
+## Gadget Requirements
+
+For memory changes to work:
+
+1. **Read-modify-write**: Gadget must read, modify, then write
+2. **Controllable address**: Can set address register
+3. **Controllable data**: Can set data/operand register
+4. **Independence**: Address and data registers are different
+5. **Self-contained**: No special initial state required
+
+Example gadget analysis:
+```asm
+; add dword ptr [rax], ebx; ret
+; - Reads from [rax]
+; - Adds ebx
+; - Writes back to [rax]
+; - addr_dependencies = {rax}
+; - data_dependencies = {rbx}
+; - Independent: YES
+```
+
+## Deprecated Method
+
+### add_to_mem
+
+```python
+add_to_mem(addr, value, size=None)
+```
+
+<Warning>
+This method is deprecated. Use `mem_add()` instead.
+</Warning>
+
+From source code (mem_changer.py:217-219):
+
+```python
+def add_to_mem(self, addr, value, size=None):
+    l.warning("add_to_mem is deprecated, please use mem_add!")
+    return self._mem_change('add', addr, value, size=size)
+```
+
+## Performance Considerations
+
+- Gadgets are sorted by data_size (larger first) for efficiency
+- Verification adds overhead but ensures correctness
+- Multiple operations can be chained efficiently
+- Size should match actual data requirements
+
+## Architecture Support
+
+Works across all supported architectures:
+
+- **x86/x86_64**: Full support
+- **ARM/ARM64**: Full support  
+- **MIPS**: Full support
+- **PowerPC**: Full support
+
+## See Also
+
+- [MemWriter](/api/mem-writer) - Writing data to memory
+- [Memory Operations Guide](/guides/memory-operations) - Usage examples
+- [Badbytes Guide](/guides/badbytes) - Handling restricted bytes

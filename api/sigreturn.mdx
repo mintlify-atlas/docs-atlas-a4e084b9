@@ -1,0 +1,435 @@
+---
+title: SigreturnBuilder
+description: SROP chain builder for crafting sigreturn-based exploitation chains
+---
+
+The `SigreturnBuilder` class builds SROP (Sigreturn-Oriented Programming) chains that use the sigreturn syscall to set all registers and control execution flow with a single syscall.
+
+## Overview
+
+Sigreturn is a powerful technique that allows setting arbitrary register values including PC and SP in one operation. Accessed through `rop.sigreturn()`, SigreturnBuilder automatically:
+- Creates properly formatted sigreturn frames
+- Invokes the sigreturn syscall
+- Handles stack pointer calculations
+- Supports chaining after sigreturn
+- Provides execve convenience method
+
+## Class Definition
+
+```python
+class SigreturnBuilder
+```
+
+Located in `angrop/chain_builder/sigreturn.py`
+
+## Public Methods
+
+### sigreturn
+
+```python
+sigreturn(**registers) -> RopChain
+```
+
+Builds a sigreturn chain that sets arbitrary registers.
+
+<ParamField path="**registers">
+  Keyword arguments mapping register names to values. All registers can be set including:
+  - General purpose: rax, rbx, rcx, etc.
+  - Stack pointer: rsp
+  - Instruction pointer: rip
+  - Flags: rflags (on x64)
+</ParamField>
+
+**Returns:** A `RopChain` containing sigreturn syscall and frame.
+
+**Raises:** `RopException` if sigreturn is not supported or cannot be built.
+
+### sigreturn_syscall
+
+```python
+sigreturn_syscall(syscall_num, args, sp=None) -> RopChain
+```
+
+Builds a sigreturn chain that sets up and invokes a specific syscall.
+
+<ParamField path="syscall_num" type="int" required>
+  Syscall number to invoke after sigreturn.
+</ParamField>
+
+<ParamField path="args" type="list" required>
+  Arguments for the syscall (mapped to registers per syscall convention).
+</ParamField>
+
+<ParamField path="sp" type="int | None" default="None">
+  New stack pointer value. If provided, allows chaining after the syscall.
+</ParamField>
+
+**Returns:** A `RopChain` that performs sigreturn then invokes the syscall.
+
+### sigreturn_execve
+
+```python
+sigreturn_execve(path_addr=None) -> RopChain
+```
+
+Convenience method to invoke execve via sigreturn.
+
+<ParamField path="path_addr" type="int | None" required>
+  Address containing the path string (e.g., "/bin/sh").
+</ParamField>
+
+**Returns:** A `RopChain` that spawns a shell via SROP.
+
+**Raises:** `RopException` if path_addr is None.
+
+## ROP Instance Methods
+
+```python
+rop.sigreturn(**registers)
+rop.sigreturn_syscall(syscall_num, args, sp=None)
+rop.sigreturn_execve(path_addr=None)
+```
+
+## Implementation Details
+
+### Sigreturn Frame Structure
+
+Sigreturn uses a frame structure defined by the OS kernel:
+
+From the sigreturn module:
+
+```python
+from angrop.sigreturn import SigreturnFrame
+
+frame = SigreturnFrame.from_project(project)
+frame.update(**registers)
+frame_words = frame.to_words()
+```
+
+Frame layout (x86_64):
+```
++0x00: uc_flags
++0x08: uc_stack pointer
++0x10: r8
++0x18: r9
++0x20: r10
+...
++0x28-0xa0: All GPRs
++0xa8: rip
++0xb0: eflags
++0xb8-0xf8: FP state
+```
+
+### Stack Pointer Calculation
+
+SigreturnBuilder calculates where the frame should be placed:
+
+From source code (sigreturn.py:18-31):
+
+```python
+def _execute_sp_delta(self, chain):
+    state = chain.sim_exec_til_syscall()
+    if state is None:
+        raise RopException("Fail to execute sigreturn chain")
+    
+    # Account for stack pop before syscall
+    init_state = chain._blank_state.copy()
+    init_state.stack_pop()
+    init_sp = init_state.solver.eval(init_state.regs.sp)
+    sp_at_syscall = state.solver.eval(state.regs.sp)
+    delta = sp_at_syscall - init_sp
+    offset_words = delta // self.project.arch.bytes
+    return offset_words
+```
+
+### Frame Placement
+
+From source code (sigreturn.py:132-154):
+
+```python
+offset_words = self._execute_sp_delta(chain)
+filler = self.chain_builder.roparg_filler or 0
+
+if 0 < offset_words < len(chain._values):
+    # Truncate chain to offset
+    chain._values = chain._values[:offset_words]
+elif offset_words < 0:
+    # Drop frame values to fit
+    frame_words = frame_words[-offset_words:]
+elif offset_words > len(chain._values):
+    # Pad with filler
+    for _ in range(offset_words - len(chain._values)):
+        chain.add_value(filler)
+
+# Add frame
+for word in frame_words:
+    chain.add_value(word)
+```
+
+## Usage Examples
+
+### Basic Sigreturn
+
+```python
+import angr
+import angrop
+
+proj = angr.Project("/bin/bash")
+rop = proj.analyses.ROP()
+rop.find_gadgets()
+
+# Set all registers via sigreturn
+chain = rop.sigreturn(
+    rax=0x1337,
+    rbx=0x5656,
+    rip=0x400123,  # Where to jump
+    rsp=0x61b100   # New stack
+)
+```
+
+### Sigreturn Execve
+
+```python
+# Write command string
+chain = rop.write_to_mem(0x61b100, b"/bin/sh\x00")
+
+# Execute via sigreturn
+chain += rop.sigreturn_execve(path_addr=0x61b100)
+```
+
+### Sigreturn to Syscall
+
+```python
+# Setup and call read(0, buffer, size) via sigreturn
+chain = rop.sigreturn_syscall(
+    0,  # read syscall
+    [0, 0x61b100, 0x100],  # args
+    sp=0x61b200  # New stack for continuation
+)
+```
+
+### Complete SROP Chain
+
+```python
+proj = angr.Project("./vuln")
+rop = proj.analyses.ROP()
+rop.find_gadgets()
+
+# Find gadget addresses
+syscall_gadget = None
+for g in rop.syscall_gadgets:
+    syscall_gadget = g.addr
+    break
+
+# Build SROP chain
+chain = rop.sigreturn(
+    rax=59,           # execve syscall number
+    rdi=0x61b100,     # path argument
+    rsi=0,            # argv
+    rdx=0,            # envp
+    rip=syscall_gadget # Jump to syscall; ret
+)
+
+# Write "/bin/sh"
+prep = rop.write_to_mem(0x61b100, b"/bin/sh\x00")
+final_chain = prep + chain
+```
+
+### Chaining After Sigreturn
+
+```python
+# Set up stack for continuation
+new_stack = 0x61b200
+
+# First sigreturn
+chain = rop.sigreturn(
+    rax=0,
+    rdi=0,
+    rsi=0x61b100,
+    rdx=0x100,
+    rip=syscall_gadget,
+    rsp=new_stack  # Stack for next ROP chain
+)
+
+# Can now chain more ROP after the syscall
+# because rsp points to new_stack
+```
+
+### Setting Flags
+
+```python
+# Set specific flags
+chain = rop.sigreturn(
+    rax=0x1337,
+    rflags=0x202,  # IF flag set
+    rip=0x400123
+)
+```
+
+## Architecture Support
+
+### x86_64 Linux
+
+```python
+# Syscall number: 15 (rt_sigreturn)
+arch.sigreturn_num = 15
+
+# All 64-bit registers can be set
+chain = rop.sigreturn(
+    rax=0x3b,      # execve
+    rdi=path_addr,
+    rsi=0,
+    rdx=0,
+    rip=syscall_addr
+)
+```
+
+### x86 (32-bit) Linux
+
+```python
+# Syscall number: 119 (sigreturn)
+arch.sigreturn_num = 119
+
+# All 32-bit registers
+chain = rop.sigreturn(
+    eax=0xb,       # execve
+    ebx=path_addr,
+    ecx=0,
+    edx=0,
+    eip=int80_addr
+)
+```
+
+### ARM Linux
+
+```python
+# Syscall number: varies by kernel
+chain = rop.sigreturn(
+    r0=path_addr,
+    r1=0,
+    r2=0,
+    r7=11,         # execve
+    pc=svc_addr
+)
+```
+
+## Sigreturn vs Regular ROP
+
+### Advantages of SROP
+
+1. **Single operation**: Set all registers at once
+2. **Minimal gadgets**: Only need syscall gadget
+3. **Full control**: Can set PC, SP, and flags
+4. **Badbyte friendly**: Frame data can be manipulated
+
+### Disadvantages
+
+1. **Frame size**: Requires significant stack space (~248 bytes on x64)
+2. **Platform specific**: Frame layout varies by OS/arch
+3. **Limited scenarios**: Need control of stack and syscall gadget
+
+## Error Handling
+
+### "sigreturn is not supported on this architecture"
+
+Raised when architecture doesn't support sigreturn.
+
+**Solution:** Only Linux on x86/x64/ARM supports sigreturn.
+
+### "{os} is not supported!"
+
+Raised when OS is not Linux.
+
+**Solution:** SROP only works on Linux.
+
+### "target does not contain syscall gadget!"
+
+Raised when no syscall gadgets exist.
+
+**Solution:** Binary must have `syscall; ret` or similar.
+
+### "Fail to execute sigreturn chain until syscall"
+
+Raised when chain execution fails.
+
+**Solution:** Check gadgets and frame setup.
+
+### "path_addr is required for sigreturn_execve"
+
+Raised when path_addr is None.
+
+**Solution:** Provide address with command string.
+
+## Frame Pretty Printing
+
+Sigreturn frames are pretty-printed in chain output:
+
+From source code (sigreturn.py:153-154):
+
+```python
+# Save frame info for printing
+chain._sigreturn_frame = (frame, frame_start_offset)
+```
+
+When you call `chain.pp()`, the frame is displayed:
+
+```
+0x0000000000400123: pop rax; ret
+                    0xf
+0x0000000000400456: syscall; ret
+--- Sigreturn Frame ---
+rax: 0x3b
+rdi: 0x61b100
+rsi: 0x0
+rdx: 0x0
+rip: 0x400789
+...
+```
+
+## Best Practices
+
+1. **Check support**: Verify `arch.sigreturn_num` is not None
+2. **Plan stack**: Ensure sufficient stack space for frame
+3. **Set PC correctly**: Point to syscall gadget or next ROP
+4. **Use for complex setups**: When many registers need setting
+5. **Verify frame size**: Different architectures have different sizes
+
+## Performance Considerations
+
+- Frame creation is lightweight
+- Stack space requirement is significant
+- Single syscall is very efficient
+- No need for many gadgets
+
+## Advanced Techniques
+
+### Stack Pivoting with SROP
+
+```python
+# Pivot to new stack and continue ROP
+chain = rop.sigreturn(
+    rsp=new_stack_addr,
+    rip=gadget_addr
+)
+# Chain continues at new_stack_addr
+```
+
+### Kernel SROP
+
+```python
+proj = angr.Project("./vmlinux", load_options={'auto_load_libs': False})
+rop = proj.analyses.ROP(kernel_mode=True)
+rop.find_gadgets()
+
+# Kernel sigreturn for privilege escalation
+chain = rop.sigreturn(
+    # Set kernel registers
+    # ...
+)
+```
+
+## See Also
+
+- [SysCaller](/api/sys-caller) - Regular syscall invocation
+- [Syscalls Guide](/guides/syscalls) - Syscall examples
+- [RegSetter](/api/reg-setter) - Alternative register setting method

@@ -1,0 +1,113 @@
+---
+title: Introduction to angrop
+description: Automatically generate ROP chains using symbolic execution and constraint solving
+---
+
+# Welcome to angrop
+
+angrop is a powerful ROP gadget finder and chain builder that leverages angr's symbolic execution engine to automatically generate complex ROP chains. It uses symbolic execution to understand gadget effects and employs constraint solving with graph search to build chains that would take hours for humans to construct manually.
+
+<Note>
+  angrop can generate ROP chains **faster than humans**. In many cases, it can build complex chains that take hours manually in just seconds.
+</Note>
+
+## Key Features
+
+<CardGroup cols={2}>
+  <Card title="Multi-Architecture Support" icon="microchip">
+    Works with x86/x64, ARM, AArch64, MIPS, and RISC-V (64-bit). Architecture-agnostic design makes it easy to extend.
+  </Card>
+  
+  <Card title="Symbolic Execution" icon="atom">
+    Built on angr's symbolic execution engine to understand gadget effects and generate precise chains.
+  </Card>
+  
+  <Card title="CLI & Python API" icon="code">
+    Simple command-line tool for quick tasks, powerful Python API for advanced chain building.
+  </Card>
+  
+  <Card title="Kernel ROP Support" icon="server">
+    Not just for userspace binaries - works with the Linux kernel for container escape chains and more.
+  </Card>
+</CardGroup>
+
+## Design Philosophy
+
+angrop uses a fundamentally different approach than traditional ROP tools:
+
+- **Symbolic Execution**: Instead of pattern matching, angrop symbolically executes gadgets to understand their true effects
+- **Constraint Solving**: Uses constraint solving to find gadget combinations that achieve desired outcomes
+- **Graph Search**: Builds a graph of gadget dependencies and searches for optimal chains
+- **Architecture Agnostic**: Core design works across multiple architectures without special-casing
+
+## Quick Example
+
+```python
+import angr
+import angrop
+
+# Load binary
+p = angr.Project("/bin/ls")
+
+# Initialize ROP analysis
+rop = p.analyses.ROP()
+rop.find_gadgets()
+
+# Generate chain to set registers
+chain = rop.set_regs(rax=0x41414141, rbx=0x42424242)
+chain.print_payload_code()
+```
+
+## Get Started
+
+<CardGroup cols={2}>
+  <Card title="Installation" icon="download" href="/installation">
+    Install angrop and its dependencies
+  </Card>
+  
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Build your first ROP chain in minutes
+  </Card>
+  
+  <Card title="Python API" icon="book" href="/api/rop">
+    Explore the full Python API capabilities
+  </Card>
+  
+  <Card title="Examples" icon="flask" href="/examples/simple-chain">
+    See angrop in action with real-world examples
+  </Card>
+</CardGroup>
+
+## Supported Architectures
+
+angrop currently supports:
+
+- **x86/x64** - Full support for Intel/AMD architectures
+- **ARM** - 32-bit ARM support
+- **AArch64** - 64-bit ARM support
+- **MIPS** - MIPS architecture support
+- **RISC-V** - 64-bit RISC-V support
+
+<Info>
+  Want support for another architecture? angrop's architecture-agnostic design makes it relatively easy to add new architectures supported by angr. Create an issue on GitHub and we'll look into it!
+</Info>
+
+## Research Paper
+
+angrop's design and capabilities are described in detail in our NDSS 2026 paper:
+
+**[ropbot: Reimaging Code Reuse Attack Synthesis](https://kylebot.net/papers/ropbot.pdf)**
+
+Kyle Zeng, Moritz Schloegel, Christopher Salls, Adam Doupé, Ruoyu Wang, Yan Shoshitaishvili, Tiffany Bao
+
+*In Proceedings of the Network and Distributed System Security Symposium (NDSS), February 2026*
+
+## Use Cases
+
+angrop excels at:
+
+- **Exploit Development**: Automatically generate ROP chains for binary exploitation
+- **CTF Competitions**: Quickly build chains for time-sensitive competitions
+- **Security Research**: Test binary defenses and explore ROP possibilities
+- **Kernel Exploitation**: Build chains for Linux kernel exploitation and container escapes
+- **Architecture Research**: Study ROP gadget availability across different architectures

@@ -1,0 +1,298 @@
+---
+title: ROP
+description: Core ROP gadget finder and chain builder class
+---
+
+The `ROP` class is angrop's primary interface for semantic-aware ROP gadget discovery and chain building. It extends angr's `Analysis` class and provides methods for finding gadgets, managing them, and building exploit chains.
+
+## Class Definition
+
+```python
+class ROP(Analysis)
+```
+
+Semantic-aware ROP gadget finder that analyzes binary code to discover exploitable gadgets and build ROP chains.
+
+## Constructor
+
+```python
+ROP(only_check_near_rets=True, max_block_size=None, max_sym_mem_access=None,
+    fast_mode=None, rebase=None, is_thumb=False, kernel_mode=False, 
+    stack_gsize=80, cond_br=False, max_bb_cnt=2)
+```
+
+<ParamField path="only_check_near_rets" type="bool" default="True">
+  If true, skip blocks that are not near ret instructions. This significantly speeds up gadget finding.
+</ParamField>
+
+<ParamField path="max_block_size" type="int | None" default="None">
+  Limits the size of blocks considered. Longer blocks are less likely to be good ROP gadgets.
+</ParamField>
+
+<ParamField path="max_sym_mem_access" type="int | None" default="None">
+  Maximum number of symbolic memory accesses to allow in a gadget.
+</ParamField>
+
+<ParamField path="fast_mode" type="bool | None" default="None">
+  When True, skip gadgets with conditional branches, floating point operations, and jumps. Allows smaller gadget size. If None, automatically decides based on binary size.
+</ParamField>
+
+<ParamField path="rebase" type="any" default="None">
+  **Deprecated.** This parameter is no longer used in angrop.
+</ParamField>
+
+<ParamField path="is_thumb" type="bool" default="False">
+  Execute ROP chain in ARM Thumb mode. Only affects ARM architecture. angrop does not switch modes within a chain.
+</ParamField>
+
+<ParamField path="kernel_mode" type="bool" default="False">
+  Find kernel mode gadgets instead of user mode gadgets.
+</ParamField>
+
+<ParamField path="stack_gsize" type="int" default="80">
+  Maximum allowable stack change for gadgets. Max stack_change = stack_gsize * arch.bytes.
+</ParamField>
+
+<ParamField path="cond_br" type="bool" default="False">
+  Whether to support conditional branches. This option significantly impacts gadget finding speed.
+</ParamField>
+
+<ParamField path="max_bb_cnt" type="int" default="2">
+  Maximum basic block count to consider in gadgets.
+</ParamField>
+
+## Attributes
+
+After calling `find_gadgets()`, `find_gadgets_single_threaded()`, or `load_gadgets()`, the following attributes are populated:
+
+<ResponseField name="rop_gadgets" type="list[RopGadget]">
+  List of gadgets used for ROP operations (e.g., `pop rax; ret`).
+</ResponseField>
+
+<ResponseField name="pivot_gadgets" type="list[PivotGadget]">
+  List of gadgets used for stack pivoting (e.g., `mov rsp, rbp; ret`).
+</ResponseField>
+
+<ResponseField name="syscall_gadgets" type="list[SyscallGadget]">
+  List of gadgets used for invoking system calls (e.g., `syscall; ret` or `int 0x80; ret`).
+</ResponseField>
+
+<ResponseField name="badbytes" type="list[int]">
+  List of bytes that should not appear in generated ROP chains.
+</ResponseField>
+
+<ResponseField name="roparg_filler" type="int | None">
+  Integer value used when popping useless registers. If None, symbolic values are used.
+</ResponseField>
+
+<ResponseField name="arch" type="RopArch">
+  Architecture object from the gadget finder.
+</ResponseField>
+
+## Gadget Discovery Methods
+
+### find_gadgets
+
+```python
+find_gadgets(optimize=True, **kwargs) -> list[RopGadget]
+```
+
+Finds all gadgets in the binary using multiple processes.
+
+<ParamField path="optimize" type="bool" default="True">
+  Whether to run chain_builder.optimize(). This may take time but makes the chain builder more powerful.
+</ParamField>
+
+<ParamField path="processes" type="int" default="4">
+  Number of processes to use for parallel gadget analysis.
+</ParamField>
+
+<ParamField path="show_progress" type="bool" default="True">
+  Whether to display a progress bar during gadget finding.
+</ParamField>
+
+**Returns:** List of discovered ROP gadgets.
+
+### find_gadgets_single_threaded
+
+```python
+find_gadgets_single_threaded(show_progress=True, optimize=True) -> list[RopGadget]
+```
+
+Finds all gadgets in the binary using a single thread. Useful for debugging or when multiprocessing causes issues.
+
+<ParamField path="show_progress" type="bool" default="True">
+  Whether to display a progress bar.
+</ParamField>
+
+<ParamField path="optimize" type="bool" default="True">
+  Whether to run chain_builder.optimize().
+</ParamField>
+
+**Returns:** List of discovered ROP gadgets.
+
+### analyze_gadget
+
+```python
+analyze_gadget(addr) -> RopGadget | None
+```
+
+Analyzes a specific address to identify if it's a valid ROP gadget. Filters out gadgets containing conditional branches.
+
+<ParamField path="addr" type="int" required>
+  Address to analyze.
+</ParamField>
+
+**Returns:** RopGadget object if valid, None otherwise.
+
+### analyze_addr
+
+```python
+analyze_addr(addr) -> list[RopGadget] | None
+```
+
+Analyzes an address and returns all possible gadgets starting from that address. This includes gadgets with conditional branches.
+
+<ParamField path="addr" type="int" required>
+  Address to analyze.
+</ParamField>
+
+**Returns:** List of RopGadget objects or None.
+
+### analyze_gadget_list
+
+```python
+analyze_gadget_list(addr_list, processes=4, show_progress=True, optimize=True) -> list[RopGadget]
+```
+
+Analyzes a list of addresses to identify ROP gadgets.
+
+<ParamField path="addr_list" type="list[int]" required>
+  List of addresses to analyze.
+</ParamField>
+
+<ParamField path="processes" type="int" default="4">
+  Number of processes to use.
+</ParamField>
+
+<ParamField path="show_progress" type="bool" default="True">
+  Whether to show progress bar.
+</ParamField>
+
+<ParamField path="optimize" type="bool" default="True">
+  Whether to optimize the chain builder.
+</ParamField>
+
+**Returns:** List of discovered ROP gadgets.
+
+## Gadget Management Methods
+
+### save_gadgets
+
+```python
+save_gadgets(path)
+```
+
+Saves discovered gadgets to a file using pickle serialization.
+
+<ParamField path="path" type="str" required>
+  Path to the file where gadgets will be stored.
+</ParamField>
+
+### load_gadgets
+
+```python
+load_gadgets(path, optimize=True)
+```
+
+Loads gadgets from a previously saved file.
+
+<ParamField path="path" type="str" required>
+  Path to the file containing saved gadgets.
+</ParamField>
+
+<ParamField path="optimize" type="bool" default="True">
+  Whether to optimize the chain builder after loading.
+</ParamField>
+
+## Configuration Methods
+
+### set_badbytes
+
+```python
+set_badbytes(badbytes)
+```
+
+Define bytes that should not appear in the generated ROP chain.
+
+<ParamField path="badbytes" type="list[int]" required>
+  List of 8-bit integers representing bad bytes (e.g., `[0x00, 0x09]` for null and tab).
+</ParamField>
+
+### get_badbytes
+
+```python
+get_badbytes() -> list[int]
+```
+
+**Returns:** List of currently configured bad bytes.
+
+### set_roparg_filler
+
+```python
+set_roparg_filler(roparg_filler)
+```
+
+Define the filler value used when ROP chains need to pop useless registers.
+
+<ParamField path="roparg_filler" type="int | None" required>
+  Integer value to use as filler, or None to use symbolic values (constraint solver will choose, usually 0).
+</ParamField>
+
+## Chain Building Methods
+
+All public methods from [ChainBuilder](/api/chain-builder) are automatically exposed through the ROP instance after gadgets are found. These include:
+
+- `set_regs()` - Set register values
+- `move_regs()` - Move values between registers  
+- `write_to_mem()` - Write data to memory
+- `func_call()` - Call a function with arguments
+- `do_syscall()` - Invoke a system call
+- `execve()` - Execute execve syscall
+- `pivot()` - Perform stack pivot
+- And more...
+
+See the [ChainBuilder documentation](/api/chain-builder) for details.
+
+## Example Usage
+
+```python
+import angr
+
+# Load binary
+project = angr.Project('/bin/ls')
+
+# Create ROP instance
+rop = project.analyses.ROP()
+
+# Find gadgets
+rop.find_gadgets()
+
+# Set bad bytes
+rop.set_badbytes([0x00, 0x0a])
+
+# Build a chain to set registers
+chain = rop.set_regs(rax=0x1234, rbx=0x5678)
+
+# Print the chain
+chain.print_payload_code()
+
+# Save gadgets for later use
+rop.save_gadgets('gadgets.cache')
+```
+
+## Internal Properties
+
+<ResponseField name="chain_builder" type="ChainBuilder">
+  Property that returns the ChainBuilder instance. Created lazily on first access. All ChainBuilder public methods are copied to the ROP instance.
+</ResponseField>

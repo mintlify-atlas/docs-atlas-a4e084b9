@@ -1,0 +1,372 @@
+---
+title: 'Configuration Options'
+description: 'Detailed reference for ROP class initialization parameters and configuration'
+---
+
+## ROP Class Initialization
+
+The `ROP` class is the main entry point for semantic-aware ROP gadget finding. It extends angr's `Analysis` class and provides comprehensive configuration options.
+
+```python
+from angr import Project
+
+p = Project('/bin/ls')
+rop = p.analyses.ROP(
+    only_check_near_rets=True,
+    max_block_size=20,
+    max_sym_mem_access=2,
+    fast_mode=None,
+    is_thumb=False,
+    kernel_mode=False,
+    stack_gsize=80,
+    cond_br=False,
+    max_bb_cnt=2
+)
+```
+
+## Configuration Parameters
+
+### only_check_near_rets
+
+<ParamField path="only_check_near_rets" type="bool" default="True">
+  If `True`, only analyze blocks that are within `max_block_size` bytes of return instructions. This dramatically speeds up gadget finding by avoiding analysis of code that cannot form valid gadgets.
+
+  **Performance Impact:** Reduces search space by 10-100x on typical binaries
+
+  **Limitations:** 
+  - Only effective for i386, amd64, and aarch64 architectures
+  - Automatically disabled with warning for other architectures
+  - May miss gadgets in unusual code locations (rare in practice)
+
+  **When to disable:**
+  - Analyzing obfuscated or hand-crafted code
+  - Working with non-standard architectures
+  - Need exhaustive gadget coverage
+</ParamField>
+
+### max_block_size
+
+<ParamField path="max_block_size" type="int | None" default="None">
+  Limits the maximum size (in bytes) of basic blocks considered for gadgets. Longer blocks are less likely to be useful ROP gadgets because they:
+  - Have more side effects
+  - Are harder to chain together
+  - May contain unwanted operations
+
+  **Default Values by Architecture:**
+  - x86/x64: 20 bytes (normal), 12 bytes (fast mode)
+  - ARM: 16 bytes (normal), 8 bytes (fast mode)
+  - MIPS: 20 bytes (normal), 12 bytes (fast mode)
+
+  **Trade-offs:**
+  - **Smaller values:** Faster analysis, simpler gadgets, may miss complex operations
+  - **Larger values:** Slower analysis, more complex gadgets, more side effects
+
+  **Recommended:**
+  - Standard exploitation: Use default
+  - Speed-critical: 12-16 bytes
+  - Advanced techniques: 24-32 bytes
+</ParamField>
+
+### max_sym_mem_access
+
+<ParamField path="max_sym_mem_access" type="int | None" default="None">
+  Maximum number of symbolic memory accesses allowed in a gadget. Memory accesses complicate:
+  - Constraint solving during chain building
+  - Gadget semantics and side effects
+  - Reliability of exploitation
+
+  **What counts as symbolic memory access:**
+  - Memory reads/writes where the address depends on registers
+  - Excludes word-sized stack accesses (considered normal)
+  - Excludes constant address accesses
+
+  **Default Values:**
+  - Normal mode: 2 accesses
+  - Fast mode: 1 access
+
+  **Examples:**
+  ```asm
+  # 0 symbolic accesses (stack operations)
+  pop rax
+  pop rbx
+  ret
+
+  # 1 symbolic access
+  mov [rax], rbx
+  ret
+
+  # 2 symbolic accesses
+  mov rcx, [rax]
+  mov [rbx], rcx
+  ret
+  ```
+
+  **Trade-offs:**
+  - **Lower values:** Faster, simpler gadgets, may limit write/read primitives
+  - **Higher values:** Slower, more powerful memory operations
+</ParamField>
+
+### fast_mode
+
+<ParamField path="fast_mode" type="bool | None" default="None">
+  Enables aggressive optimizations to speed up gadget finding at the cost of completeness.
+
+  **Auto-detection:** When set to `None`, automatically enables for binaries with >20,000 address candidates
+
+  **Optimizations enabled:**
+  - Reduces `max_block_size` to architecture's `fast_mode_max_block_size`
+  - Sets `max_sym_mem_access` to 1
+  - Skips gadgets with:
+    - Conditional branches
+    - Floating point operations  
+    - Non-return jumps
+
+  **Performance:** 2-5x faster analysis
+
+  **When to use:**
+  - Large binaries (>1MB)
+  - Initial gadget discovery
+  - Time-constrained scenarios
+
+  **When to avoid:**
+  - Need advanced gadgets (conditional branches, complex operations)
+  - Small binaries where speed is not critical
+  - Comprehensive gadget coverage required
+</ParamField>
+
+### is_thumb
+
+<ParamField path="is_thumb" type="bool" default="False">
+  Execute ROP chain in ARM Thumb mode (16-bit instruction encoding).
+
+  **Requirements:**
+  - Only valid for ARM architecture binaries
+  - Raises assertion error if used with non-ARM binaries
+
+  **Important Notes:**
+  - angrop does not support mode switching within a ROP chain
+  - All gadgets in the chain must be in the same mode (ARM or Thumb)
+  - The initial gadget must be at an address with the Thumb bit set (addr | 1)
+
+  **Example:**
+  ```python
+  # For ARM Thumb binary
+  p = angr.Project('thumb_binary', arch='arm')
+  rop = p.analyses.ROP(is_thumb=True)
+  rop.find_gadgets()
+  
+  # All gadget addresses will have LSB = 1
+  ```
+</ParamField>
+
+### kernel_mode
+
+<ParamField path="kernel_mode" type="bool" default="False">
+  Find gadgets suitable for kernel-mode exploitation.
+
+  **Changes in behavior:**
+  - Searches only in `.text` section (if available)
+  - Does not look for syscall gadgets near return instructions
+  - Uses kernel-specific architecture configuration
+
+  **Use cases:**
+  - Linux kernel exploit development
+  - Kernel module exploitation
+  - Privilege escalation from kernel context
+
+  **Example:**
+  ```python
+  # Analyze kernel binary
+  p = angr.Project('vmlinux')
+  rop = p.analyses.ROP(kernel_mode=True)
+  ```
+</ParamField>
+
+### stack_gsize
+
+<ParamField path="stack_gsize" type="int" default="80">
+  Number of controllable pointer-sized elements on the stack. Defines the maximum allowable stack change for gadgets.
+
+  **Maximum stack change:** `stack_gsize * arch.bytes`
+
+  **Examples:**
+  - 64-bit: `stack_gsize=80` → max stack change = 640 bytes
+  - 32-bit: `stack_gsize=80` → max stack change = 320 bytes
+
+  **Implications:**
+  - Gadgets with `stack_change > stack_gsize * arch.bytes` are rejected
+  - Affects initial state setup (symbolic stack size)
+  - Influences pivot gadget analysis
+
+  **Trade-offs:**
+  - **Smaller values:** 
+    - Faster constraint solving
+    - Rejects gadgets with large stack pops
+    - May limit available gadgets
+  - **Larger values:**
+    - Slower symbolic execution
+    - Accepts gadgets with many pops
+    - More memory usage
+
+  **Recommended values:**
+  - Standard exploitation: 80-100
+  - Constrained environments: 40-60
+  - Complex chains: 120-160
+
+  **Example:**
+  ```python
+  # Large stack for complex chains
+  rop = p.analyses.ROP(stack_gsize=150)
+  
+  # This gadget would be accepted:
+  # pop rax; pop rbx; pop rcx; ... (up to 150 pops)
+  ```
+</ParamField>
+
+### cond_br
+
+<ParamField path="cond_br" type="bool" default="False">
+  Enable support for gadgets containing conditional branches. When enabled, a single address may produce multiple gadgets (one per execution path).
+
+  **Performance Impact:** 
+  - Significantly slower gadget analysis (2-10x)
+  - Increases number of gadgets found
+  - Complicates chain building
+
+  **Gadget representation:**
+  - Each conditional path becomes a separate gadget
+  - Gadgets have `has_conditional_branch` flag
+  - Branch dependencies tracked in `branch_dependencies`
+
+  **Example without cond_br:**
+  ```asm
+  ; Address 0x401000 - SKIPPED (has conditional branch)
+  test rax, rax
+  jz skip
+  pop rbx
+  skip:
+  ret
+  ```
+
+  **Example with cond_br:**
+  ```python
+  rop = p.analyses.ROP(cond_br=True)
+  gadgets = rop.analyze_addr(0x401000)
+  # Returns list of 2 gadgets:
+  # 1. Path where jz is taken (rax == 0)
+  # 2. Path where jz is not taken (rax != 0, pops rbx)
+  ```
+
+  **When to enable:**
+  - Need maximum gadget coverage
+  - Exploiting binaries with limited gadgets
+  - Advanced ROP techniques (conditional chains)
+
+  **When to disable:**
+  - Speed is critical
+  - Sufficient gadgets without conditional branches
+  - Simplify chain building logic
+</ParamField>
+
+### max_bb_cnt
+
+<ParamField path="max_bb_cnt" type="int" default="2">
+  Maximum number of basic blocks to traverse when analyzing a gadget. Controls the depth of symbolic execution.
+
+  **What it controls:**
+  - Number of steps taken during symbolic execution
+  - Complexity of control flow followed
+  - Analysis timeout behavior
+
+  **Examples:**
+  - `max_bb_cnt=1`: Only single basic block gadgets
+  - `max_bb_cnt=2`: Gadgets spanning up to 2 basic blocks (e.g., call + ret)
+  - `max_bb_cnt=3`: More complex multi-block gadgets
+
+  **Trade-offs:**
+  - **Lower values:**
+    - Faster analysis
+    - Simpler gadgets
+    - May miss useful sequences
+  - **Higher values:**
+    - Slower analysis (exponential growth)
+    - More complex gadgets
+    - May include gadgets with excessive side effects
+
+  **Recommended:**
+  - Standard use: 2 (default)
+  - Simple gadgets only: 1
+  - Complex gadgets: 3-4 (use with caution)
+
+  **Performance note:** Each additional basic block can multiply analysis time, especially with `cond_br=True`
+</ParamField>
+
+## Deprecated Parameters
+
+### rebase
+
+<Warning>
+The `rebase` parameter is deprecated and no longer has any effect. A warning is logged if this parameter is provided.
+</Warning>
+
+In older versions, this parameter was used to adjust gadget addresses for PIE binaries. Modern angrop handles rebasing automatically through the chain builder.
+
+## Configuration Examples
+
+### Default Configuration
+
+```python
+# Balanced speed and coverage
+rop = p.analyses.ROP()
+```
+
+### Speed-Optimized Configuration
+
+```python
+# Fast analysis for large binaries
+rop = p.analyses.ROP(
+    fast_mode=True,
+    max_block_size=12,
+    max_sym_mem_access=1,
+    only_check_near_rets=True,
+    cond_br=False,
+    max_bb_cnt=1
+)
+```
+
+### Comprehensive Coverage Configuration
+
+```python
+# Maximum gadget discovery
+rop = p.analyses.ROP(
+    fast_mode=False,
+    max_block_size=32,
+    max_sym_mem_access=3,
+    only_check_near_rets=False,
+    cond_br=True,
+    max_bb_cnt=3,
+    stack_gsize=120
+)
+```
+
+### Kernel Exploitation Configuration
+
+```python
+# Kernel-mode gadget finding
+rop = p.analyses.ROP(
+    kernel_mode=True,
+    max_block_size=24,
+    stack_gsize=100
+)
+```
+
+### ARM Thumb Configuration
+
+```python
+# ARM Thumb mode
+rop = p.analyses.ROP(
+    is_thumb=True,
+    max_block_size=16,
+    stack_gsize=80
+)
+```

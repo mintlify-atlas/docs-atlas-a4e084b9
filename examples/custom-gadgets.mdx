@@ -1,0 +1,318 @@
+---
+title: 'Working with Custom Gadgets'
+description: 'Analyzing specific addresses and building custom gadget lists'
+---
+
+Sometimes you know exactly where a useful gadget is located, or you want to analyze specific addresses without doing a full gadget search. angrop provides methods to analyze individual addresses and work with custom gadget lists.
+
+## Analyzing Specific Addresses
+
+### analyze_gadget() - Single Gadget
+
+Analyze a specific address and filter out conditional branches:
+
+```python
+import angr
+import angrop
+
+proj = angr.Project("/bin/bash")
+rop = proj.analyses.ROP()
+
+# Analyze a specific address
+# Returns a RopGadget object or None
+gadget = rop.analyze_gadget(0x401234)
+
+if gadget:
+    print(f"Found gadget at {hex(gadget.addr)}")
+    print(f"Instructions: {gadget}")
+    print(f"Stack change: {gadget.stack_change}")
+    print(f"Changed registers: {gadget.changed_regs}")
+else:
+    print("No valid gadget at this address")
+```
+
+**Key behavior:**
+- Filters out gadgets with conditional branches
+- Returns a single `RopGadget` object or `None`
+- Automatically adds the gadget to the ROP chain builder
+- Re-screens all gadgets based on current badbytes
+
+### analyze_addr() - Multiple Gadgets with Branches
+
+For addresses with conditional branches, get all possible execution paths:
+
+```python
+# Analyze address including conditional branches
+# Returns a list of RopGadget objects or None
+gadgets = rop.analyze_addr(0x401234)
+
+if gadgets:
+    print(f"Found {len(gadgets)} gadgets at this address:")
+    for i, g in enumerate(gadgets):
+        print(f"\nPath {i+1}:")
+        print(f"  Address: {hex(g.addr)}")
+        print(f"  Instructions: {g}")
+        print(f"  Conditions: {g.get_conditions()}")
+else:
+    print("No valid gadgets at this address")
+```
+
+**Key behavior:**
+- Includes gadgets with conditional branches
+- Returns a **list** of gadgets (different execution paths)
+- Useful for analyzing complex gadgets with multiple outcomes
+
+## Source Code Reference
+
+From `angrop/rop.py:104-128`:
+
+```python
+def analyze_addr(self, addr):
+    """
+    return a list of gadgets that starts from addr
+    this is possible because of conditional branches
+    """
+    res = self.gadget_finder.analyze_gadget(addr, allow_conditional_branches=True)
+    gs:list[RopGadget]|None = cast(list[RopGadget]|None, res)
+    if not gs:
+        return gs
+    self._all_gadgets += gs
+    self._screen_gadgets()
+    return gs
+
+def analyze_gadget(self, addr):
+    """
+    return a gadget or None, it filters out gadgets containing conditional_branches
+    if you'd like those, use analyze_addr
+    """
+    res = self.gadget_finder.analyze_gadget(addr, allow_conditional_branches=False)
+    g = cast(RopGadget|None, res)
+    if g is None:
+        return g
+    self._all_gadgets.append(g)
+    self._screen_gadgets()
+    return g
+```
+
+## Analyzing Custom Gadget Lists
+
+### analyze_gadget_list() - Batch Analysis
+
+If you have a list of addresses from another tool (like ROPgadget or ropper), analyze them all:
+
+```python
+import angr
+import angrop
+
+proj = angr.Project("/bin/bash")
+rop = proj.analyses.ROP()
+
+# Custom list of gadget addresses
+custom_addresses = [
+    0x401234,
+    0x401567,
+    0x402890,
+    0x403abc,
+    # ... more addresses
+]
+
+# Analyze all addresses
+rop_gadgets = rop.analyze_gadget_list(
+    custom_addresses,
+    processes=4,        # Use multiprocessing
+    show_progress=True, # Show progress bar
+    optimize=True       # Optimize after analysis
+)
+
+print(f"Successfully analyzed {len(rop_gadgets)} gadgets")
+print(f"Total ROP gadgets: {len(rop.rop_gadgets)}")
+print(f"Syscall gadgets: {len(rop.syscall_gadgets)}")
+print(f"Pivot gadgets: {len(rop.pivot_gadgets)}")
+```
+
+**From angrop/rop.py:130-145:**
+
+```python
+def analyze_gadget_list(self, addr_list, processes=4, show_progress=True, optimize=True):
+    """
+    Analyzes a list of addresses to identify ROP gadgets.
+    Saves rop gadgets in self.rop_gadgets
+    Saves syscall gadgets in self.syscall_gadgets
+    Saves stack pivots in self.stack_pivots
+    :param processes: number of processes to use
+    :param show_progress: whether or not to show progress bar
+    """
+    self._all_gadgets = self.gadget_finder.analyze_gadget_list(
+        addr_list, processes=processes, show_progress=show_progress)
+    self._screen_gadgets()
+    if optimize:
+        self.chain_builder.optimize(processes=processes)
+    return self.rop_gadgets
+```
+
+## Practical Examples
+
+### Example 1: Verifying Manual Gadgets
+
+```python
+import angr
+import angrop
+
+proj = angr.Project("/bin/ls")
+rop = proj.analyses.ROP()
+
+# You found these gadgets manually
+manual_gadgets = {
+    0x4012a3: "pop rdi; ret",
+    0x4012a5: "pop rsi; pop r15; ret",
+    0x401234: "pop rax; ret",
+}
+
+for addr, expected in manual_gadgets.items():
+    g = rop.analyze_gadget(addr)
+    if g:
+        print(f"✓ {hex(addr)}: {g}")
+        # Verify it matches expectations
+        if expected.split(';')[0] in str(g):
+            print(f"  Matches expected: {expected}")
+    else:
+        print(f"✗ {hex(addr)}: Invalid gadget")
+```
+
+### Example 2: Analyzing After Info Leak
+
+```python
+import angr
+import angrop
+
+proj = angr.Project("/lib/x86_64-linux-gnu/libc.so.6")
+rop = proj.analyses.ROP()
+
+# Simulate: you leaked libc base at runtime
+libc_base = 0x7ffff7a00000
+
+# Known offsets for useful gadgets (from static analysis)
+offsets = [0x23a5f, 0x2a3e5, 0x142c92]
+
+# Convert offsets to runtime addresses
+runtime_addrs = [libc_base + offset for offset in offsets]
+
+# Analyze them
+for addr in runtime_addrs:
+    g = rop.analyze_gadget(addr)
+    if g:
+        print(f"Gadget at {hex(addr)}: {g}")
+```
+
+### Example 3: Combining Full Search with Custom Gadgets
+
+```python
+import angr
+import angrop
+
+proj = angr.Project("/bin/target")
+rop = proj.analyses.ROP()
+
+# First, do a full gadget search
+print("Finding gadgets...")
+rop.find_gadgets(processes=4)
+print(f"Found {len(rop.rop_gadgets)} gadgets")
+
+# Then add specific gadgets you know are useful
+custom_gadgets = [0x401234, 0x402567]
+for addr in custom_gadgets:
+    g = rop.analyze_gadget(addr)
+    if g:
+        print(f"Added custom gadget: {hex(addr)}")
+
+# Now build chains with both found and custom gadgets
+chain = rop.set_regs(rdi=0x1337, rsi=0x4141)
+chain.pp()
+```
+
+## Understanding Gadget Screening
+
+When you call `analyze_gadget()` or `analyze_addr()`, angrop automatically:
+
+1. **Analyzes the address** using symbolic execution
+2. **Adds to internal list** (`self._all_gadgets`)
+3. **Re-screens all gadgets** based on:
+   - Current badbytes
+   - Gadget type (ROP, syscall, pivot)
+4. **Updates public lists**:
+   - `rop.rop_gadgets`
+   - `rop.syscall_gadgets`
+   - `rop.pivot_gadgets`
+5. **Bootstraps chain builder** to use new gadgets
+
+### Handling Badbytes
+
+If a gadget address contains badbytes, angrop tries to find equivalent gadgets:
+
+```python
+rop.set_badbytes([0x00, 0x0a, 0x0d])
+
+# This might fail if address contains badbytes
+g = rop.analyze_gadget(0x40120a)  # Contains 0x0a!
+
+if g:
+    print(f"Found equivalent gadget at {hex(g.addr)}")
+else:
+    print("No gadget available without badbytes")
+```
+
+From the source (`angrop/rop.py:78-91`):
+```python
+if self._contain_badbytes(g.addr):
+    # Try to find equivalent gadget from duplicates
+    block = self.project.factory.block(g.addr)
+    h = self.gadget_finder.block_hash(block)
+    if h not in self._duplicates:
+        continue
+    for addr in self._duplicates[h]:
+        if not self._contain_badbytes(addr):
+            break
+```
+
+## Gadget Properties
+
+Once you have a gadget, you can inspect its properties:
+
+```python
+g = rop.analyze_gadget(0x401234)
+
+if g:
+    # Basic properties
+    print(f"Address: {hex(g.addr)}")
+    print(f"Block size: {g.block_length}")
+    print(f"Stack change: {g.stack_change}")
+    
+    # Register analysis
+    print(f"Changed registers: {g.changed_regs}")
+    print(f"Popped registers: {g.popped_regs}")
+    
+    # Type information
+    print(f"Type: {type(g).__name__}")
+    # Possible types: RopGadget, PivotGadget, SyscallGadget
+```
+
+## When to Use Each Method
+
+| Method | Use Case |
+|--------|----------|
+| `analyze_gadget(addr)` | Known good address, want simple gadget |
+| `analyze_addr(addr)` | Complex gadget with branches, want all paths |
+| `analyze_gadget_list(addrs)` | Batch import from external tool |
+| `find_gadgets()` | Full automatic search |
+
+## Performance Tips
+
+1. **Use multiprocessing** for large address lists
+2. **Disable optimization** initially with `optimize=False` if you're still exploring
+3. **Cache gadgets** with `save_gadgets()` and `load_gadgets()`
+4. **Set badbytes early** to avoid analyzing unusable gadgets
+
+## Related Examples
+
+- [Kernel Escape Chain](/examples/kernel-escape) - Real-world kernel exploitation
+- [Complex Chains](/examples/complex-chains) - Advanced chain composition

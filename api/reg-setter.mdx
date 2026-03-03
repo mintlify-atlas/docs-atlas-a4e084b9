@@ -1,0 +1,338 @@
+---
+title: RegSetter
+description: Register setting chain builder for setting registers to concrete or symbolic values
+---
+
+The `RegSetter` class is responsible for building ROP chains that set registers to specific values. It uses graph search algorithms and optimization techniques to find the most efficient gadget combinations.
+
+## Overview
+
+Accessed through the ROP instance as `rop.set_regs()`, RegSetter automatically:
+- Finds optimal gadgets to set registers
+- Handles badbytes in register values
+- Uses register moves when direct pops aren't available
+- Constructs values using arithmetic when needed
+
+## Class Definition
+
+```python
+class RegSetter(Builder)
+```
+
+Located in `angrop/chain_builder/reg_setter.py`
+
+## Public Methods
+
+### run
+
+```python
+run(modifiable_memory_range=None, preserve_regs=None, warn=True, **registers) -> RopChain
+```
+
+Builds a ROP chain that sets the specified registers.
+
+<ParamField path="modifiable_memory_range" type="tuple | None" default="None">
+  Range of memory addresses that can be modified (start, end). Used for gadgets that require memory access.
+</ParamField>
+
+<ParamField path="preserve_regs" type="set | None" default="None">
+  Set of register names that must not be modified during chain generation.
+</ParamField>
+
+<ParamField path="warn" type="bool" default="True">
+  Whether to log warnings if register setting fails.
+</ParamField>
+
+<ParamField path="**registers">
+  Keyword arguments mapping register names to values (int, RopValue, or symbolic).
+</ParamField>
+
+**Returns:** A `RopChain` that sets all specified registers.
+
+**Raises:** `RopException` if registers cannot be set.
+
+### can_set_reg
+
+```python
+can_set_reg(reg) -> bool
+```
+
+Checks if a register can be set to arbitrary values.
+
+<ParamField path="reg" type="str" required>
+  Register name to check.
+</ParamField>
+
+**Returns:** True if the register can be set, False otherwise.
+
+### verify
+
+```python
+verify(chain, preserve_regs, registers) -> bool
+```
+
+Verifies that a chain correctly sets registers without clobbering preserved ones.
+
+<ParamField path="chain" type="RopChain" required>
+  The chain to verify.
+</ParamField>
+
+<ParamField path="preserve_regs" type="set" required>
+  Registers that should not be modified.
+</ParamField>
+
+<ParamField path="registers" type="dict" required>
+  Target register values.
+</ParamField>
+
+**Returns:** True if verification passes, False otherwise.
+
+## ROP Instance Method
+
+When you call `rop.set_regs()`, it invokes `RegSetter.run()` internally:
+
+```python
+rop.set_regs(**registers, preserve_regs=None)
+```
+
+## Implementation Details
+
+### Graph Search Algorithm
+
+RegSetter uses a sophisticated graph-based approach:
+
+1. **Node representation**: Each node represents a state where certain registers are correctly set
+2. **Edge creation**: Edges represent gadgets that can transition between states
+3. **Path finding**: Uses NetworkX to find shortest paths from initial state to target state
+
+From source code (reg_setter.py:474-612):
+
+```python
+# Build graph where nodes = (True/False for each register)
+src = (False, False, False)  # Nothing set
+dst = (True, True, True)     # All registers set
+
+# Find all simple paths with cutoff to limit complexity
+paths = nx.all_simple_paths(graph, source=src, target=dst, 
+                           cutoff=min(len(registers)+2, 6))
+```
+
+### Handling Hard Registers
+
+Registers that can't be directly popped are handled specially:
+
+1. **Badbytes in values**: Uses arithmetic gadgets to construct the value
+2. **No pop gadgets**: Uses concrete value gadgets or register moves
+3. **Arithmetic chains**: Combines setter + changer gadgets
+
+From source code (reg_setter.py:699-725):
+
+```python
+# Find chains like: pop rax; ret => add rax, rbx; ret
+for g1 in concrete_setter_gadgets:
+    for g2 in delta_gadgets:
+        # Try to construct target value via arithmetic
+        if ast.concrete_value == val.concreted:
+            return [g1, g2]
+```
+
+### Optimization Strategies
+
+RegSetter includes two optimization passes:
+
+#### 1. Register Move Optimization
+
+```python
+_optimize_with_reg_moves()
+```
+
+Finds opportunities to set hard registers by moving from settable ones.
+
+Example: If `r15` can't be popped but `rax` can:
+```python
+# Instead of failing, use:
+pop rax; ret       # Set rax to value
+mov r15, rax; ret  # Move to r15
+```
+
+#### 2. Gadget Normalization
+
+```python
+_optimize_with_gadgets()
+```
+
+Normalizes complex gadgets to enable new register setting capabilities.
+
+## Usage Examples
+
+### Basic Register Setting
+
+```python
+import angr
+import angrop
+
+proj = angr.Project("/bin/bash")
+rop = proj.analyses.ROP()
+rop.find_gadgets()
+
+# Set a single register
+chain = rop.set_regs(rax=0x1337)
+chain.pp()
+```
+
+Output:
+```
+0x0000000000410b23: pop rax; ret 
+                    0x1337
+```
+
+### Setting Multiple Registers
+
+```python
+# Set multiple registers at once
+chain = rop.set_regs(
+    rax=0x1337,
+    rbx=0x5656,
+    rcx=0x4242
+)
+```
+
+### Preserving Register Values
+
+```python
+# Set rax without modifying rbx
+chain = rop.set_regs(rax=0x1337, preserve_regs={'rbx'})
+
+# Useful when chaining operations
+chain = rop.set_regs(rax=0x1337)
+chain += rop.set_regs(rbx=0x4141, preserve_regs={'rax'})
+# rax is still 0x1337 after the second operation
+```
+
+### Setting Registers with Badbytes
+
+```python
+proj = angr.Project("/bin/bash")
+rop = proj.analyses.ROP()
+rop.set_badbytes([0x00, 0x0a])
+rop.find_gadgets()
+
+# Value contains badbyte 0x0a
+chain = rop.set_regs(rax=0x0a0a0a0a)
+
+# RegSetter uses arithmetic to construct it:
+# pop rax; ret => 0x0a0a0a0b
+# sub rax, 1; ret
+```
+
+### Kernel Mode Example
+
+From angrop's kernel test suite:
+
+```python
+proj = angr.Project("./vmlinux_sym")
+rop = proj.analyses.ROP(kernel_mode=True)
+rop.find_gadgets()
+
+init_cred = 0xffffffff8368b220
+init_nsproxy = 0xffffffff8368ad00
+
+# Step 1: Call function
+chain = rop.func_call("find_task_by_vpid", [1])
+
+# Step 2: Move return value to rdi
+chain += rop.move_regs(rdi='rax')
+
+# Step 3: Set rsi while preserving rdi
+chain += rop.set_regs(rsi=init_nsproxy, preserve_regs={'rdi'})
+
+# Step 4: Use both preserved registers
+chain += rop.func_call("switch_task_namespaces", [], 
+                       preserve_regs={'rdi', 'rsi'})
+```
+
+### Symbolic Register Values
+
+```python
+import claripy
+
+# Create symbolic value
+sym_val = claripy.BVS("my_value", 64)
+
+# Set register to symbolic value
+chain = rop.set_regs(rax=sym_val)
+# Solver will find concrete values during chain generation
+```
+
+## Internal Components
+
+RegSetter uses several helper builders:
+
+### ConcreteRegSetter
+
+Finds gadgets that set registers to specific concrete values.
+
+Example gadgets:
+```asm
+xor eax, eax; ret       ; Sets eax to 0
+or rax, 0xffffffff; ret ; Sets rax to 0xffffffff
+```
+
+### ConcreteRegChanger
+
+Finds gadgets that modify register values using arithmetic.
+
+Example gadgets:
+```asm
+add rax, rbx; ret
+sub rcx, 1; ret
+xor rdx, rsi; ret
+```
+
+## Error Handling
+
+### Common Errors
+
+#### "Couldn't set registers :("
+
+Raised when no valid gadget chain can be found.
+
+**Solutions:**
+1. Run `find_gadgets(optimize=True)`
+2. Try using `move_regs()` from a register that can be set
+3. Check if badbytes are too restrictive
+4. Verify register names are correct for your architecture
+
+#### "unknown registers"
+
+Raised when invalid register names are provided.
+
+**Solution:** Use valid register names for your architecture (e.g., `rax` not `eax` on x64).
+
+#### "too many registers contain bad bytes"
+
+Raised when multiple register values contain badbytes.
+
+**Solution:** Currently only one register with badbytes is supported at a time.
+
+## Performance Considerations
+
+- Graph search is limited to paths of length ≤ 6 to avoid exponential complexity
+- Only top 5 gadgets per edge are considered after reduction
+- Gadget filtering removes duplicates with same effect
+- Optimization passes may take time but significantly improve capabilities
+
+## Architecture Support
+
+RegSetter works across all architectures supported by angrop:
+
+- **x86/x86_64**: Full support for all GPRs
+- **ARM/ARM64**: Support for r0-r15, x0-x30
+- **MIPS**: Support for $t0-$t9, $s0-$s7, etc.
+- **PowerPC**: Support for r0-r31
+
+## See Also
+
+- [RegMover](/api/reg-mover) - Moving values between registers
+- [ChainBuilder](/api/chain-builder) - Main chain building interface
+- [Register Operations Guide](/guides/register-operations) - Usage examples and patterns

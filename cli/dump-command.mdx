@@ -1,0 +1,52 @@
+---
+title: dump Command
+description: Find and list all ROP gadgets in a binary
+---
+
+## Overview
+
+The `dump` command finds all ROP gadgets in the target binary and displays them with their addresses and operations.
+
+## Usage
+
+```bash
+angrop-cli dump <path>
+```
+
+### Arguments
+
+- `path` - Path to the binary to analyze
+
+## Output Format
+
+Each gadget is displayed in the following format:
+
+```
+<address>: <self-contained>: <operations>
+```
+
+- **address** - The address of the gadget (right-justified with zeros)
+- **self-contained** - `true` or `false` indicating whether the gadget is self-contained
+- **operations** - The disassembly of the gadget instructions
+
+### Self-Contained Indicator
+
+The `true`/`false` indicator marks whether a gadget is **self-contained**. A self-contained gadget does not have unwanted side effects and can be used reliably in ROP chains without affecting other registers or memory unexpectedly.
+
+## Example Output
+
+```bash
+$ angrop-cli dump /bin/ls
+0x11735: true  : adc bl, byte ptr [rbx + 0x4c]; mov eax, esp; pop r12; pop r13; pop r14; pop rbp; ret 
+0x10eaa: true  : adc eax, 0x12469; add rsp, 0x38; pop rbx; pop r12; pop r13; pop r14; pop r15; pop rbp; ret 
+00xe026: true  : adc eax, 0xcec8; pop rbx; cmove rax, rdx; pop r12; pop rbp; ret 
+00xdfd4: true  : adc eax, 0xcf18; pop rbx; cmove rax, rdx; pop r12; pop rbp; ret 
+00xdfa5: true  : adc eax, 0xcf4d; pop rbx; cmove rax, rdx; pop r12; pop rbp; ret 
+......
+```
+
+Gadgets are sorted alphabetically by their disassembly and displayed with addresses aligned for easy reading.
+
+## Performance
+
+The dump command caches discovered gadgets in `/tmp` based on an MD5 hash of the binary contents. Subsequent runs on the same binary will load gadgets from cache for faster execution.

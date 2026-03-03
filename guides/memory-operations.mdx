@@ -1,0 +1,451 @@
+---
+title: Memory Operations
+description: Write data to memory and perform arithmetic operations on memory locations
+---
+
+Angrop provides powerful methods to write data to memory and modify memory contents using arithmetic and logical operations. These operations are essential for setting up data structures, strings, and shellcode.
+
+## Writing to Memory: `write_to_mem()`
+
+The `write_to_mem()` method writes arbitrary data to a specified memory address.
+
+### Method Signature
+
+```python
+rop.write_to_mem(addr, data, preserve_regs=None, fill_byte=b"\xff")
+```
+
+**Parameters:**
+- `addr`: Target memory address (integer or RopValue)
+- `data`: Bytes to write (must be a bytes object)
+- `preserve_regs`: Set of register names that should not be modified
+- `fill_byte`: Single byte used to pad data if needed (default: `b"\xff"`)
+
+**Returns:** A `RopChain` that writes the data to memory
+
+### Basic Examples
+
+<Steps>
+  <Step title="Write a string to memory">
+    ```python
+    import angr
+    import angrop
+
+    proj = angr.Project("/bin/bash")
+    rop = proj.analyses.ROP()
+    rop.find_gadgets()
+
+    # Write "/bin/sh" to address 0x61b100
+    chain = rop.write_to_mem(0x61b100, b"/bin/sh\x00")
+    chain.pp()
+    ```
+  </Step>
+
+  <Step title="Write binary data">
+    ```python
+    # Write shellcode to memory
+    shellcode = b"\x31\xc0\x48\xbb\xd1\x9d\x96\x91\xd0\x8c\x97\xff"
+    chain = rop.write_to_mem(0x61b000, shellcode)
+    ```
+  </Step>
+
+  <Step title="Write with register preservation">
+    ```python
+    # Write data without modifying rax
+    chain = rop.write_to_mem(0x61b100, b"data", preserve_regs={'rax'})
+    ```
+  </Step>
+</Steps>
+
+<Note>
+Angrop automatically handles writing data in chunks based on available gadgets. It will use the most efficient write size (8, 4, 2, or 1 byte) depending on what gadgets are available.
+</Note>
+
+## Real-World Example: Building an Execve Chain
+
+From angrop's Python API documentation:
+
+```python
+import angr
+import angrop
+
+proj = angr.Project("/bin/bash")
+rop = proj.analyses.ROP()
+rop.find_gadgets()
+
+# Write "/bin/sh" to memory
+chain = rop.write_to_mem(0x61b100, b"/bin/sh\x00")
+
+# Call execve with the string address
+chain += rop.func_call("execve", [0x61b100, 0, 0])
+
+# Or use the convenience method
+chain = rop.execve()  # Automatically writes "/bin/sh" and calls execve
+```
+
+## Writing Files and Paths
+
+```python
+import os
+import angr
+import angrop
+
+proj = angr.Project("./binary")
+rop = proj.analyses.ROP()
+rop.find_gadgets()
+
+# Write a file path
+chain = rop.write_to_mem(0x61b100, b"/home/ctf/flag\x00")
+
+# Open the file
+chain += rop.func_call("open", [0x61b100, os.O_RDONLY])
+
+# Read into buffer
+chain += rop.func_call("read", [3, 0x61b200, 0x100])
+
+# Write to stdout
+chain += rop.func_call("write", [1, 0x61b200, 0x100])
+```
+
+## Memory Addition: `mem_add()`
+
+Add a value to data stored at a memory location.
+
+### Method Signature
+
+```python
+rop.mem_add(addr, value, size=None)
+```
+
+**Parameters:**
+- `addr`: Memory address to modify
+- `value`: Value to add (integer or RopValue)
+- `size`: Number of bytes to operate on (1, 2, 4, or 8). Default is architecture word size.
+
+**Returns:** A `RopChain` that performs the addition
+
+### Example
+
+```python
+import angr
+import angrop
+
+proj = angr.Project("/bin/bash")
+rop = proj.analyses.ROP()
+rop.find_gadgets()
+
+# Add 0x1000 to the value at address 0x804f124
+chain = rop.mem_add(0x804f124, 0x1000)
+
+# Add with specific size (4 bytes)
+chain = rop.mem_add(0x804f124, 0x1000, size=4)
+```
+
+<Note>
+The memory operation methods require gadgets that can perform memory writes with arithmetic operations, such as `add dword ptr [rax], ebx; ret`.
+</Note>
+
+## Memory XOR: `mem_xor()`
+
+XOR data at a memory location with a value.
+
+### Method Signature
+
+```python
+rop.mem_xor(addr, value, size=None)
+```
+
+**Parameters:**
+- `addr`: Memory address to modify
+- `value`: Value to XOR with
+- `size`: Number of bytes (1, 2, 4, or 8)
+
+### Example
+
+```python
+# XOR the value at 0x804f124 with 0x41414141
+chain = rop.mem_xor(0x804f124, 0x41414141)
+
+# Useful for encoding/decoding data in memory
+encoded_value = 0x12345678
+key = 0xdeadbeef
+chain = rop.write_to_mem(0x61b100, encoded_value.to_bytes(4, 'little'))
+chain += rop.mem_xor(0x61b100, key, size=4)
+# Memory now contains: 0x12345678 ^ 0xdeadbeef
+```
+
+## Memory OR: `mem_or()`
+
+Perform bitwise OR on data at a memory location.
+
+### Method Signature
+
+```python
+rop.mem_or(addr, value, size=None)
+```
+
+**Parameters:**
+- `addr`: Memory address to modify
+- `value`: Value to OR with
+- `size`: Number of bytes (1, 2, 4, or 8)
+
+### Example
+
+```python
+# Set specific bits at a memory location
+chain = rop.mem_or(0x804f124, 0x000000ff, size=4)
+
+# Useful for setting flags or enabling bits
+chain = rop.write_to_mem(0x61b100, b"\x00\x00\x00\x00")
+chain += rop.mem_or(0x61b100, 0x80000000, size=4)  # Set MSB
+```
+
+## Memory AND: `mem_and()`
+
+Perform bitwise AND on data at a memory location.
+
+### Method Signature
+
+```python
+rop.mem_and(addr, value, size=None)
+```
+
+**Parameters:**
+- `addr`: Memory address to modify
+- `value`: Value to AND with
+- `size`: Number of bytes (1, 2, 4, or 8)
+
+### Example
+
+```python
+# Clear specific bits at a memory location
+chain = rop.mem_and(0x804f124, 0xffffff00, size=4)
+
+# Useful for masking or disabling bits
+chain = rop.write_to_mem(0x61b100, b"\xff\xff\xff\xff")
+chain += rop.mem_and(0x61b100, 0x0000ffff, size=4)  # Keep only lower 16 bits
+```
+
+## Complete Memory Operations Example
+
+From angrop's Python API documentation:
+
+```python
+import angr
+import angrop
+
+proj = angr.Project("/bin/bash")
+rop = proj.analyses.ROP()
+rop.find_gadgets()
+
+# Write initial value
+chain = rop.write_to_mem(0x804f124, b"\x00\x00\x00\x00")
+
+# Add to memory
+chain += rop.mem_add(0x804f124, 0x41414141)
+
+# XOR to encode
+chain += rop.mem_xor(0x804f124, 0x12345678)
+
+# OR to set flags
+chain += rop.mem_or(0x804f124, 0x80000000)
+
+# AND to mask
+chain += rop.mem_and(0x804f124, 0xffffffff)
+```
+
+## Writing with Badbytes
+
+When badbytes are configured, angrop uses sophisticated techniques to avoid them:
+
+```python
+import angr
+import angrop
+
+proj = angr.Project("/bin/bash")
+rop = proj.analyses.ROP()
+
+# Configure badbytes (null bytes and newlines)
+rop.set_badbytes([0x00, 0x0a])
+rop.find_gadgets()
+
+# Write data containing badbytes
+data = b"\x00\x0a\x0d\xff"  # Contains 0x00 and 0x0a
+chain = rop.write_to_mem(0x61b100, data)
+
+# Angrop automatically:
+# 1. Writes safe initial values
+# 2. Uses mem_xor/mem_add/mem_or/mem_and to construct the target bytes
+```
+
+### How Badbyte Avoidance Works
+
+From the source code (`mem_writer.py:606-630`), angrop uses multiple strategies:
+
+<Steps>
+  <Step title="Try chunk transforms">
+    Find operations (XOR, OR, AND, ADD) that can transform safe bytes into target bytes:
+    ```python
+    # Example: To write 0x0a (badbyte)
+    # Write 0x0b (safe), then subtract 1
+    # Or write 0x00 (if safe), then OR with 0x0a via intermediate
+    ```
+  </Step>
+
+  <Step title="Try per-byte operations">
+    Handle each byte individually using different operations:
+    ```python
+    # Byte 0: XOR
+    # Byte 1: ADD
+    # Byte 2: OR
+    # etc.
+    ```
+  </Step>
+
+  <Step title="Use register arithmetic">
+    Construct values in registers using arithmetic, then write to memory.
+  </Step>
+</Steps>
+
+<Tip>
+The `fill_byte` parameter should never be a badbyte. Angrop will raise an error if you try to use a badbyte as `fill_byte`.
+</Tip>
+
+## Memory Write Gadget Requirements
+
+For memory operations to work, angrop needs specific types of gadgets:
+
+### For `write_to_mem()`:
+- Gadgets like: `mov [rax], rbx; ret`
+- Controllable address register (rax)
+- Controllable data register (rbx)
+- Address and data must be independent
+
+### For `mem_add()`, `mem_xor()`, etc.:
+- Gadgets like: `add [rax], ebx; ret`
+- `xor [rdi], rsi; ret`
+- `or [rcx], rdx; ret`
+- `and [r8], r9; ret`
+
+<Note>
+If you get "Fail to write data to memory" or "Fail to perform _mem_change" errors, it means angrop couldn't find suitable gadgets. Try:
+1. Using `fast_mode=False` when initializing ROP
+2. Checking if the binary has the necessary gadgets
+3. Using alternative approaches (e.g., setting up registers and using library functions)
+</Note>
+
+## Advanced Memory Techniques
+
+### Building Data Structures
+
+```python
+import struct
+import angr
+import angrop
+
+proj = angr.Project("/bin/bash")
+rop = proj.analyses.ROP()
+rop.find_gadgets()
+
+# Build a simple structure in memory
+struct_addr = 0x61b100
+
+# Write struct fields
+chain = rop.write_to_mem(struct_addr + 0, struct.pack('<Q', 0x1234))
+chain += rop.write_to_mem(struct_addr + 8, struct.pack('<Q', 0x5678))
+chain += rop.write_to_mem(struct_addr + 16, b"name\x00")
+```
+
+### Writing Pointer Arrays
+
+```python
+# Build argv array for execve
+argv_addr = 0x61b200
+arg0_addr = 0x61b100  # Points to "/bin/sh"
+
+# Write the string
+chain = rop.write_to_mem(arg0_addr, b"/bin/sh\x00")
+
+# Write pointer array
+chain += rop.write_to_mem(argv_addr, struct.pack('<Q', arg0_addr))
+chain += rop.write_to_mem(argv_addr + 8, struct.pack('<Q', 0))  # NULL terminator
+
+# Call execve
+chain += rop.func_call("execve", [arg0_addr, argv_addr, 0])
+```
+
+### Modifying Existing Data
+
+```python
+# Increment a counter in memory
+counter_addr = 0x804f000
+chain = rop.mem_add(counter_addr, 1, size=4)
+
+# Toggle a flag
+flag_addr = 0x804f004
+chain += rop.mem_xor(flag_addr, 1, size=1)
+
+# Enable specific bits in a bitmask
+mask_addr = 0x804f008
+chain += rop.mem_or(mask_addr, 0b10101010, size=1)
+
+# Clear specific bits
+chain += rop.mem_and(mask_addr, 0b11110000, size=1)
+```
+
+## Size Specification
+
+All memory operations support explicit size specification:
+
+```python
+# 1 byte (8-bit)
+chain = rop.mem_add(addr, 0xff, size=1)
+
+# 2 bytes (16-bit)
+chain = rop.mem_xor(addr, 0xffff, size=2)
+
+# 4 bytes (32-bit)
+chain = rop.mem_or(addr, 0xffffffff, size=4)
+
+# 8 bytes (64-bit)
+chain = rop.mem_and(addr, 0xffffffffffffffff, size=8)
+```
+
+<Tip>
+If you don't specify `size`, angrop uses the architecture's default word size (4 bytes for 32-bit, 8 bytes for 64-bit).
+</Tip>
+
+## Error Handling
+
+```python
+from angrop.errors import RopException
+
+try:
+    # This might fail if address contains badbytes
+    chain = rop.write_to_mem(0x0a0a0a0a, b"data")
+except RopException as e:
+    print(f"Write failed: {e}")
+    # Use an alternative address
+    chain = rop.write_to_mem(0x61b100, b"data")
+```
+
+## Best Practices
+
+1. **Choose safe addresses**: Use addresses that don't contain badbytes
+2. **Minimize writes**: Write larger chunks when possible instead of byte-by-byte
+3. **Use fill_byte wisely**: Choose a fill byte that's not a badbyte
+4. **Verify operations**: Use `chain.pp()` to inspect generated chains
+5. **Consider data alignment**: Some gadgets may require aligned addresses
+
+## Performance Considerations
+
+- Writing large data may generate long chains
+- Memory operations with badbytes are slower due to additional transformations
+- Using `size` parameter efficiently can reduce chain length
+- Preservation of registers adds constraints and may increase chain complexity
+
+## Next Steps
+
+- [Function Calls](/guides/function-calls) - Use memory writes to set up function arguments
+- [Syscalls](/guides/syscalls) - Combine memory writes with syscalls for exploits
+- [Badbytes](/guides/badbytes) - Learn more about handling restricted bytes

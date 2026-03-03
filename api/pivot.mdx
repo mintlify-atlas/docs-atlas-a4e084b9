@@ -1,0 +1,478 @@
+---
+title: Pivot
+description: Stack pivoting chain builder for moving the stack pointer to arbitrary locations
+---
+
+The `Pivot` class builds ROP chains that perform stack pivoting - moving the stack pointer to a different memory location to enable exploitation when stack space is limited.
+
+## Overview
+
+Accessed through the ROP instance as `rop.pivot()`, Pivot automatically:
+- Finds gadgets that modify the stack pointer
+- Supports pivoting to addresses or register values
+- Handles different pivot mechanisms (mov, xchg, add, etc.)
+- Manages pre-pivot stack setup
+- Verifies pivot operations
+
+## Class Definition
+
+```python
+class Pivot(Builder)
+```
+
+Located in `angrop/chain_builder/pivot.py`
+
+## Public Methods
+
+### pivot
+
+```python
+pivot(thing) -> RopChain
+```
+
+Builds a chain that pivots the stack pointer.
+
+<ParamField path="thing" type="RopValue" required>
+  Target for the pivot. Can be:
+  - Address (RopValue with concrete address)
+  - Register (RopValue with register name)
+</ParamField>
+
+**Returns:** A `RopChain` that pivots the stack.
+
+**Raises:** `RopException` if pivot cannot be performed.
+
+### pivot_addr
+
+```python
+pivot_addr(addr) -> RopChain
+```
+
+Pivots stack to a specific address.
+
+<ParamField path="addr" type="RopValue" required>
+  Target address for the new stack location.
+</ParamField>
+
+**Returns:** A `RopChain` that pivots to the address.
+
+### pivot_reg
+
+```python
+pivot_reg(reg_val) -> RopChain
+```
+
+Pivots stack to an address stored in a register.
+
+<ParamField path="reg_val" type="RopValue" required>
+  RopValue representing a register containing the target address.
+</ParamField>
+
+**Returns:** A `RopChain` that pivots to the register value.
+
+## ROP Instance Method
+
+```python
+rop.pivot(target)
+```
+
+Automatically detects whether target is address or register:
+
+```python
+# Pivot to address
+chain = rop.pivot(rop_utils.cast_rop_value(0x61b100, proj))
+
+# Pivot to register
+reg_val = rop_utils.cast_rop_value('rax', proj)
+chain = rop.pivot(reg_val)
+```
+
+## Implementation Details
+
+### Pivot Gadget Types
+
+Pivot recognizes several gadget patterns:
+
+1. **Direct move**: `mov rsp, rbp; ret`
+2. **Exchange**: `xchg rsp, rax; ret`
+3. **Add to SP**: `add rsp, 0x100; ret`
+4. **Pop to SP**: `pop rsp; ret`
+5. **Leave**: `leave; ret` (equivalent to `mov rsp, rbp; pop rbp; ret`)
+
+From source code (pivot.py:10-25):
+
+```python
+def cmp(g1, g2):
+    # Prefer gadgets with fewer SP controllers
+    if len(g1.sp_reg_controllers) < len(g2.sp_reg_controllers):
+        return -1
+    
+    # Then prefer smaller stack changes
+    if g1.stack_change + g1.stack_change_after_pivot < \
+       g2.stack_change + g2.stack_change_after_pivot:
+        return -1
+    
+    # Finally prefer fewer instructions
+    if g1.isn_count < g2.isn_count:
+        return -1
+    
+    return 0
+```
+
+### SP Controllers
+
+Gadgets are analyzed to identify which registers control the final SP value:
+
+From source code (pivot.py:111-113):
+
+```python
+def _effect_tuple(self, g):
+    v1 = tuple(sorted(g.sp_controllers))
+    return (v1, g.stack_change, g.stack_change_after_pivot)
+```
+
+Example:
+```asm
+mov rsp, rbp; ret
+; sp_controllers = {rbp}
+
+xchg rsp, rax; ret
+; sp_controllers = {rax}
+
+add rsp, 0x18; ret
+; sp_controllers = {}  # Offset-based, not register-controlled
+```
+
+### Pivot to Address
+
+From source code (pivot.py:43-75):
+
+```python
+def pivot_addr(self, addr):
+    for gadget in self._pivot_gadgets:
+        # Make symbolic state
+        init_state = self.make_sim_state(
+            gadget.addr, 
+            gadget.stack_change_before_pivot//arch_bytes+1
+        )
+        
+        # Step gadget
+        final_state = rop_utils.step_to_unconstrained_successor(
+            self.project, init_state
+        )
+        
+        # Constrain final SP to target
+        final_state.solver.add(final_state.regs.sp == addr.data)
+        
+        # Extract required register values
+        registers = {}
+        for x in gadget.sp_reg_controllers:
+            registers[x] = final_state.solver.eval(
+                init_state.registers.load(x)
+            )
+        
+        # Build chain
+        chain = self.chain_builder.set_regs(**registers)
+        chain.add_gadget(gadget)
+        
+        # Verify
+        state = chain.exec(stop_at_pivot=True)
+        if state.solver.eval(state.regs.sp == addr.data):
+            return chain
+```
+
+### Pivot to Register
+
+From source code (pivot.py:77-109):
+
+```python
+def pivot_reg(self, reg_val):
+    reg = reg_val.reg_name
+    
+    for gadget in self._pivot_gadgets:
+        if reg not in gadget.sp_reg_controllers:
+            continue
+        
+        # Build and verify chain
+        chain = self.chain_builder.set_regs()
+        chain.add_gadget(gadget)
+        
+        # Verify SP is from correct register
+        state = chain.exec(stop_at_pivot=True)
+        variables = set(state.regs.sp.variables)
+        if len(variables) == 1 and \
+           variables.pop().startswith(f'sreg_{reg}'):
+            return chain
+```
+
+## Usage Examples
+
+### Basic Stack Pivot to Address
+
+```python
+import angr
+import angrop
+from angrop import rop_utils
+
+proj = angr.Project("/bin/bash")
+rop = proj.analyses.ROP()
+rop.find_gadgets()
+
+# Pivot to new stack location
+new_stack = 0x61b100
+addr = rop_utils.cast_rop_value(new_stack, proj)
+chain = rop.pivot(addr)
+```
+
+### Pivot to Register
+
+```python
+# Set register to target address
+chain = rop.set_regs(rbp=0x61b100)
+
+# Pivot SP to value in rbp
+reg_val = rop_utils.cast_rop_value('rbp', proj)
+chain += rop.pivot(reg_val)
+
+# Or combined:
+chain = rop.set_regs(rbp=0x61b100)
+chain += rop.pivot(rop_utils.cast_rop_value('rbp', proj))
+```
+
+### Complete Pivot Example
+
+```python
+proj = angr.Project("./vuln")
+rop = proj.analyses.ROP()
+rop.find_gadgets()
+
+# Scenario: Limited stack space in initial buffer
+# but control of heap buffer at 0x61b000
+
+# Build ROP chain in heap buffer
+heap_addr = 0x61b000
+main_chain = rop.write_to_mem(0x61b100, b"/bin/sh\x00")
+main_chain += rop.execve(path_addr=0x61b100)
+
+# Initial exploit: pivot to heap
+initial_chain = rop.pivot(rop_utils.cast_rop_value(heap_addr, proj))
+
+# Deploy both chains
+# initial_chain goes in limited buffer
+# main_chain goes at heap_addr
+```
+
+### Pivot for Buffer Extension
+
+```python
+# Small buffer overflow (8 bytes)
+# Pivot to larger controllable region
+
+small_buffer_exploit = rop.set_regs(rax=large_buffer_addr)
+small_buffer_exploit += rop.pivot(
+    rop_utils.cast_rop_value('rax', proj)
+)
+
+# large_buffer_addr contains full ROP chain
+```
+
+### Chained Pivots
+
+```python
+# Pivot through multiple locations
+# Stage 1: Pivot to intermediate buffer
+chain = rop.pivot(rop_utils.cast_rop_value(0x61b000, proj))
+
+# At 0x61b000:
+stage2 = rop.write_to_mem(0x61c000, b"data")
+stage2 += rop.pivot(rop_utils.cast_rop_value(0x61c000, proj))
+
+# At 0x61c000:
+stage3 = rop.execve()
+```
+
+### Pivot with Leave Gadget
+
+```python
+# Classic buffer overflow with saved rbp control
+# leave == mov rsp, rbp; pop rbp
+
+# Set rbp to target - 8
+chain = rop.set_regs(rbp=target_addr - 8)
+
+# Find leave gadget
+for gadget in rop.pivot_gadgets:
+    if 'leave' in str(gadget):
+        chain.add_gadget(gadget)
+        break
+```
+
+## Gadget Requirements
+
+For pivoting to work:
+
+1. **SP modification**: Gadget must change stack pointer
+2. **Controllable**: SP target must be controllable via registers or offsets
+3. **No conditional branches**: Ensures predictable execution
+4. **Not jmp_reg**: Direct jumps don't help with pivoting
+5. **No symbolic access**: Memory accesses must be concrete
+
+From source code (pivot.py:118-123):
+
+```python
+def filter_gadgets(self, gadgets):
+    gadgets = [x for x in gadgets if not x.has_conditional_branch and 
+                                     x.transit_type != 'jmp_reg' and 
+                                     not x.has_symbolic_access()]
+    gadgets = self._filter_gadgets(gadgets)
+    return sorted(gadgets, key=functools.cmp_to_key(cmp))
+```
+
+## Common Pivot Patterns
+
+### x86_64 Patterns
+
+```asm
+; Direct move
+mov rsp, rbp; ret
+mov rsp, rax; ret
+
+; Exchange
+xchg rsp, rax; ret
+xchg rsp, rbp; ret
+
+; Leave (very common)
+leave; ret  ; mov rsp, rbp; pop rbp; ret
+
+; Pop
+pop rsp; ret
+
+; Add offset
+add rsp, 0x100; ret
+```
+
+### x86 (32-bit) Patterns
+
+```asm
+mov esp, ebp; ret
+xchg esp, eax; ret
+leave; ret
+pop esp; ret
+```
+
+### ARM Patterns
+
+```asm
+mov sp, r4; ret
+pop {sp, pc}
+add sp, sp, #0x10; pop {pc}
+```
+
+## Stack Change Tracking
+
+Pivot gadgets track two stack changes:
+
+1. **stack_change_before_pivot**: Stack movement before SP is modified
+2. **stack_change_after_pivot**: Stack movement after pivot
+
+From source code (pivot.py:113):
+
+```python
+return (v1, g.stack_change, g.stack_change_after_pivot)
+```
+
+Example:
+```asm
+pop rbx; mov rsp, rax; ret
+; stack_change_before_pivot = 8 (pop rbx)
+; stack_change_after_pivot = 8 (ret from new stack)
+```
+
+## Verification
+
+Pivot chains are verified using symbolic execution:
+
+```python
+state = chain.exec(stop_at_pivot=True)
+if state.solver.eval(state.regs.sp == addr.data):
+    return chain  # Pivot successful
+```
+
+The `stop_at_pivot=True` flag stops execution when SP changes significantly.
+
+## Error Handling
+
+### "Fail to pivot the stack to {addr}!"
+
+Raised when no pivot chain can be built.
+
+**Solutions:**
+1. Check if pivot gadgets exist: `rop.pivot_gadgets`
+2. Try pivoting to a register instead
+3. Use `find_gadgets(fast_mode=False)` for more gadgets
+4. Verify target address is valid
+
+### "Fail to pivot the stack to {reg}!"
+
+Raised when register-based pivot fails.
+
+**Solutions:**
+1. Check if gadgets control SP via that register
+2. Try a different register
+3. Use address-based pivot instead
+
+## Performance Considerations
+
+- Pivot gadgets are pre-filtered and sorted during bootstrap
+- Symbolic execution adds overhead for verification
+- Simpler pivots (direct moves) are faster
+- Complex pivots may require multiple gadgets
+
+## Architecture Support
+
+- **x86/x86_64**: Full support, many pivot patterns
+- **ARM/ARM64**: Full support
+- **MIPS**: Basic support
+- **PowerPC**: Basic support
+
+## Advanced Techniques
+
+### Partial Overwrites
+
+```python
+# If you can only overwrite low bytes of saved rbp
+# Calculate target that requires minimal change
+target_low = desired_addr & 0xffff
+current_high = (saved_rbp & 0xffffffffffff0000)
+target = current_high | target_low
+
+chain = rop.set_regs(rbp=target)
+chain += rop.pivot(rop_utils.cast_rop_value('rbp', proj))
+```
+
+### Info Leak + Pivot
+
+```python
+# Leak stack address
+leaked_stack = leak_function()
+
+# Calculate pivot target relative to leak
+target = leaked_stack + 0x1000
+
+# Pivot to calculated address
+chain = rop.pivot(rop_utils.cast_rop_value(target, proj))
+```
+
+## Best Practices
+
+1. **Verify target alignment**: Stack should be aligned to word boundary
+2. **Plan stack layout**: Know what will be at target address
+3. **Test pivot gadgets**: Use `chain.pp()` to inspect
+4. **Consider stack growth**: Stack grows down on most architectures
+5. **Account for saved values**: Leave gadget pops rbp first
+
+## See Also
+
+- [Shifter](/api/shifter) - Stack shifting operations
+- [ChainBuilder](/api/chain-builder) - Main chain building interface
+- [Building Chains Guide](/guides/building-chains) - ROP construction patterns

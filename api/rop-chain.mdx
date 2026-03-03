@@ -1,0 +1,432 @@
+---
+title: RopChain
+description: ROP chain representation and manipulation
+---
+
+The `RopChain` class represents a complete ROP exploit chain. It holds gadgets, stack values, constraints, and provides methods for chain composition, execution, and payload generation.
+
+## Class Definition
+
+```python
+class RopChain
+```
+
+Holds ROP chains returned by chain building methods such as `rop.set_regs()`.
+
+## Constructor
+
+```python
+RopChain(project, builder, state=None, badbytes=None)
+```
+
+<ParamField path="project" type="angr.Project" required>
+  The angr project instance.
+</ParamField>
+
+<ParamField path="builder" type="ChainBuilder" required>
+  The ChainBuilder instance that created this chain.
+</ParamField>
+
+<ParamField path="state" type="angr.SimState | None">
+  Optional symbolic state to use. If None, a blank symbolic state is created.
+</ParamField>
+
+<ParamField path="badbytes" type="list[int] | None">
+  List of bad bytes to avoid. Defaults to empty list.
+</ParamField>
+
+<Note>
+You typically don't instantiate RopChain directly. Chain building methods like `rop.set_regs()` return RopChain instances.
+</Note>
+
+## Attributes
+
+<ResponseField name="payload_len" type="int">
+  Length of the ROP chain payload in bytes.
+</ResponseField>
+
+<ResponseField name="badbytes" type="list[int]">
+  List of bytes to avoid in the payload.
+</ResponseField>
+
+## Chain Composition
+
+### Addition Operator
+
+```python
+chain1 + chain2 -> RopChain
+```
+
+Combines two ROP chains into a single chain. The second chain is appended after the first.
+
+**Example:**
+```python
+chain1 = rop.set_regs(rax=0x1234)
+chain2 = rop.set_regs(rbx=0x5678)
+full_chain = chain1 + chain2
+```
+
+**Returns:** A new RopChain combining both chains.
+
+<Warning>
+Chains with conflicting symbolic constraints cannot be combined. An exception is raised if constraints are unsatisfiable.
+</Warning>
+
+## Value and Gadget Management
+
+### add_value
+
+```python
+add_value(value)
+```
+
+Adds a value to the chain's stack.
+
+<ParamField path="value" type="int | RopValue" required>
+  Value to add to the chain.
+</ParamField>
+
+### add_gadget
+
+```python
+add_gadget(gadget)
+```
+
+Adds a gadget to the chain.
+
+<ParamField path="gadget" type="RopGadget" required>
+  The gadget to add.
+</ParamField>
+
+### set_gadgets
+
+```python
+set_gadgets(gadgets)
+```
+
+Sets the complete list of gadgets for the chain.
+
+<ParamField path="gadgets" type="list[RopGadget]" required>
+  List of gadgets.
+</ParamField>
+
+### add_constraint
+
+```python
+add_constraint(cons)
+```
+
+Adds a symbolic constraint to the chain. Useful when the chain contains symbolic values.
+
+<ParamField path="cons" type="claripy.ast.Bool" required>
+  Constraint to add.
+</ParamField>
+
+## Payload Generation
+
+### payload_str
+
+```python
+payload_str(constraints=None, base_addr=None, timeout=None) -> bytes
+```
+
+Generates the concrete byte string payload for the ROP chain.
+
+<ParamField path="constraints" type="list | claripy.ast.Bool | None">
+  Additional constraints to apply when concretizing symbolic values.
+</ParamField>
+
+<ParamField path="base_addr" type="int | None">
+  Base address of the binary. Defaults to the main object's mapped base.
+</ParamField>
+
+<ParamField path="timeout" type="int | None">
+  Timeout in seconds for solving constraints.
+</ParamField>
+
+**Returns:** Raw bytes of the ROP payload.
+
+**Example:**
+```python
+chain = rop.set_regs(rax=0x1234)
+payload = chain.payload_str()
+with open('payload.bin', 'wb') as f:
+    f.write(payload)
+```
+
+### payload_code
+
+```python
+payload_code(constraints=None, print_instructions=True, timeout=None) -> str
+```
+
+Generates Python code that constructs the ROP payload.
+
+<ParamField path="constraints" type="list | claripy.ast.Bool | None">
+  Additional constraints for concretization.
+</ParamField>
+
+<ParamField path="print_instructions" type="bool" default="True">
+  Whether to include gadget instructions as comments.
+</ParamField>
+
+<ParamField path="timeout" type="int | None">
+  Timeout in seconds.
+</ParamField>
+
+**Returns:** Python code string using `p32()`/`p64()` functions.
+
+**Example:**
+```python
+chain = rop.set_regs(rax=0x1234, rbx=0x5678)
+print(chain.payload_code())
+```
+
+Output:
+```python
+chain = b""
+chain += p64(0x400123)  # pop rax; ret
+chain += p64(0x1234)
+chain += p64(0x400456)  # pop rbx; ret
+chain += p64(0x5678)
+```
+
+### print_payload_code
+
+```python
+print_payload_code(constraints=None, print_instructions=True)
+```
+
+Prints the Python code for the payload to stdout.
+
+<ParamField path="constraints" type="list | claripy.ast.Bool | None">
+  Additional constraints.
+</ParamField>
+
+<ParamField path="print_instructions" type="bool" default="True">
+  Whether to include instruction comments.
+</ParamField>
+
+### payload_bv
+
+```python
+payload_bv() -> claripy.ast.BV
+```
+
+Generates a symbolic bitvector representation of the payload.
+
+**Returns:** Claripy bitvector of the entire payload.
+
+## Display Methods
+
+### dstr
+
+```python
+dstr() -> str
+```
+
+Generates a detailed string representation of the chain showing gadgets and values.
+
+**Returns:** Human-readable string representation.
+
+**Example Output:**
+```
+0x400123: pop rax; ret
+          0x1234
+0x400456: pop rbx; ret
+          0x5678
+```
+
+### pp
+
+```python
+pp()
+```
+
+Pretty-prints the chain using `dstr()`. Outputs to stdout.
+
+**Example:**
+```python
+chain = rop.set_regs(rax=0x1234)
+chain.pp()
+```
+
+### \_\_str\_\_
+
+```python
+__str__() -> str
+```
+
+String representation returns the payload code.
+
+**Returns:** Same as `payload_code()`.
+
+## Execution Methods
+
+### exec
+
+```python
+exec(timeout=None, stop_at_pivot=False) -> angr.SimState
+```
+
+Symbolically executes the ROP chain and returns the final state.
+
+<ParamField path="timeout" type="int | None">
+  Timeout for execution in seconds.
+</ParamField>
+
+<ParamField path="stop_at_pivot" type="bool" default="False">
+  Whether to stop execution at a stack pivot.
+</ParamField>
+
+**Returns:** The final angr SimState after executing the chain.
+
+**Example:**
+```python
+chain = rop.set_regs(rax=0x1234, rbx=0x5678)
+final_state = chain.exec()
+print(f"RAX = {final_state.regs.rax}")
+```
+
+### sim_exec_til_syscall
+
+```python
+sim_exec_til_syscall() -> angr.SimState
+```
+
+Symbolically executes the chain until a syscall is encountered.
+
+**Returns:** The state at the syscall.
+
+### concrete_exec_til_addr
+
+```python
+concrete_exec_til_addr(target_addr) -> angr.SimState
+```
+
+Concretely executes the chain until reaching a specific address.
+
+<ParamField path="target_addr" type="int" required>
+  Address to execute until.
+</ParamField>
+
+**Returns:** The state at the target address.
+
+## Utility Methods
+
+### copy
+
+```python
+copy() -> RopChain
+```
+
+Creates a deep copy of the chain.
+
+**Returns:** A new RopChain instance with copied gadgets and values.
+
+### set_timeout
+
+```python
+set_timeout(timeout)
+```
+
+Sets the timeout for this chain instance.
+
+<ParamField path="timeout" type="int" required>
+  Timeout in seconds.
+</ParamField>
+
+### set_cls_timeout (class method)
+
+```python
+RopChain.set_cls_timeout(timeout)
+```
+
+Sets the default timeout for all new RopChain instances.
+
+<ParamField path="timeout" type="int" required>
+  Default timeout in seconds.
+</ParamField>
+
+### next_pc_idx
+
+```python
+next_pc_idx() -> int | None
+```
+
+Finds the index of the next PC value in the chain. Some gadgets (like `pop pc, r1`) have the PC not as the last value.
+
+**Returns:** Index of the next PC symbolic value, or None if the chain doesn't return.
+
+### find_symbol
+
+```python
+find_symbol(addr) -> str | None
+```
+
+Finds the symbol name for an address.
+
+<ParamField path="addr" type="int" required>
+  Address to look up.
+</ParamField>
+
+**Returns:** Symbol name (with `@plt` suffix if PLT stub) or None.
+
+### set_project
+
+```python
+set_project(project)
+```
+
+Updates the project reference for the chain and all its gadgets.
+
+<ParamField path="project" type="angr.Project" required>
+  New project instance.
+</ParamField>
+
+### set_builder
+
+```python
+set_builder(builder)
+```
+
+Updates the chain builder reference.
+
+<ParamField path="builder" type="ChainBuilder" required>
+  New builder instance.
+</ParamField>
+
+## Complete Example
+
+```python
+import angr
+
+# Load binary and find gadgets
+project = angr.Project('/bin/ls')
+rop = project.analyses.ROP()
+rop.find_gadgets()
+rop.set_badbytes([0x00, 0x0a])
+
+# Build individual chains
+chain1 = rop.set_regs(rax=0x3b)  # execve syscall number
+chain2 = rop.write_to_mem(0x8048000, b'/bin/sh\x00')
+chain3 = rop.set_regs(rdi=0x8048000, rsi=0, rdx=0)
+chain4 = rop.do_syscall(0x3b, [0x8048000, 0, 0])
+
+# Combine into full exploit chain
+exploit = chain1 + chain2 + chain3 + chain4
+
+# Generate payload
+payload = exploit.payload_str()
+print(f"Payload size: {len(payload)} bytes")
+
+# Display the chain
+exploit.pp()
+
+# Generate Python code
+exploit.print_payload_code()
+
+# Test execution symbolically
+final_state = exploit.exec()
+print(f"Final state: {final_state}")
+```

@@ -1,0 +1,504 @@
+---
+title: ChainBuilder
+description: ROP chain building and composition engine
+---
+
+The `ChainBuilder` class provides high-level methods to generate common ROP chains based on discovered gadgets. It handles register setting, memory operations, function calls, system calls, and more.
+
+## Class Definition
+
+```python
+class ChainBuilder
+```
+
+Provides functions to generate common ROP chains based on existing gadgets.
+
+## Constructor
+
+```python
+ChainBuilder(project, rop_gadgets, pivot_gadgets, syscall_gadgets, arch, badbytes, roparg_filler)
+```
+
+<ParamField path="project" type="angr.Project" required>
+  The angr project instance.
+</ParamField>
+
+<ParamField path="rop_gadgets" type="list[RopGadget]" required>
+  List of ROP gadgets to use for chain building.
+</ParamField>
+
+<ParamField path="pivot_gadgets" type="list[PivotGadget]" required>
+  List of stack pivot gadgets.
+</ParamField>
+
+<ParamField path="syscall_gadgets" type="list[SyscallGadget]" required>
+  List of syscall gadgets.
+</ParamField>
+
+<ParamField path="arch" type="RopArch" required>
+  Architecture object describing the target platform.
+</ParamField>
+
+<ParamField path="badbytes" type="list[int]" required>
+  List of bytes to avoid in the generated chains.
+</ParamField>
+
+<ParamField path="roparg_filler" type="int | None" required>
+  Integer used when popping superfluous registers, or None for symbolic values.
+</ParamField>
+
+<Note>
+You typically don't instantiate ChainBuilder directly. Instead, access it through the ROP class, which automatically exposes all ChainBuilder methods.
+</Note>
+
+## Register Operations
+
+### set_regs
+
+```python
+set_regs(*args, preserve_regs=None, **registers) -> RopChain
+```
+
+Generates a ROP chain that sets registers to requested values.
+
+<ParamField path="preserve_regs" type="set[str] | None">
+  Set of register names to preserve (e.g., `{'eax', 'ebx'}`).
+</ParamField>
+
+<ParamField path="**registers" type="int | RopValue">
+  Register names mapped to their desired values.
+</ParamField>
+
+**Returns:** A [RopChain](/api/rop-chain) that sets the registers.
+
+**Example:**
+```python
+chain = rop.set_regs(rax=0x1234, rcx=0x41414141)
+```
+
+### move_regs
+
+```python
+move_regs(preserve_regs=None, **registers) -> RopChain
+```
+
+Generates a ROP chain that moves values from one register to another.
+
+<ParamField path="preserve_regs" type="set[str] | None">
+  Set of register names to preserve.
+</ParamField>
+
+<ParamField path="**registers" type="str">
+  Mapping where key is destination register and value is source register name.
+</ParamField>
+
+**Returns:** A [RopChain](/api/rop-chain) that performs the register moves.
+
+**Example:**
+```python
+chain = rop.move_regs(rax='rcx', rcx='rbx')
+```
+
+## Memory Operations
+
+### write_to_mem
+
+```python
+write_to_mem(addr, data, fill_byte=b"\xff") -> RopChain
+```
+
+Generates a ROP chain that writes data to memory.
+
+<ParamField path="addr" type="int | RopValue" required>
+  Address where data should be written.
+</ParamField>
+
+<ParamField path="data" type="bytes" required>
+  Data to write to memory.
+</ParamField>
+
+<ParamField path="fill_byte" type="bytes" default="b'\xff'">
+  Byte used to fill/pad the data if necessary.
+</ParamField>
+
+**Returns:** A [RopChain](/api/rop-chain) that writes the data.
+
+**Example:**
+```python
+chain = rop.write_to_mem(0x8048f000, b"/bin/sh\x00")
+```
+
+### add_to_mem
+
+```python
+add_to_mem(addr, value, data_size=None) -> RopChain
+```
+
+Generates a ROP chain that adds a value to a memory location.
+
+<ParamField path="addr" type="int | RopValue" required>
+  Memory address to modify.
+</ParamField>
+
+<ParamField path="value" type="int | RopValue" required>
+  Value to add to the memory location.
+</ParamField>
+
+<ParamField path="data_size" type="int | None">
+  Size of the data in bits (defaults to architecture word size).
+</ParamField>
+
+**Returns:** A [RopChain](/api/rop-chain) that performs `[addr] += value`.
+
+**Example:**
+```python
+chain = rop.add_to_mem(0x8048f124, 0x41414141)
+```
+
+### mem_xor
+
+```python
+mem_xor(addr, value, size=None) -> RopChain
+```
+
+Generates a ROP chain that XORs a memory location with a value.
+
+<ParamField path="addr" type="int | RopValue" required>
+  Memory address to modify.
+</ParamField>
+
+<ParamField path="value" type="int | RopValue" required>
+  Value to XOR with.
+</ParamField>
+
+<ParamField path="size" type="int | None">
+  Size of the operation in bytes.
+</ParamField>
+
+**Returns:** A [RopChain](/api/rop-chain) that performs `[addr] ^= value`.
+
+### mem_add
+
+```python
+mem_add(addr, value, size=None) -> RopChain
+```
+
+Generates a ROP chain that adds to a memory location.
+
+<ParamField path="addr" type="int | RopValue" required>
+  Memory address to modify.
+</ParamField>
+
+<ParamField path="value" type="int | RopValue" required>
+  Value to add.
+</ParamField>
+
+<ParamField path="size" type="int | None">
+  Size of the operation in bytes.
+</ParamField>
+
+**Returns:** A [RopChain](/api/rop-chain) that performs `[addr] += value`.
+
+### mem_or
+
+```python
+mem_or(addr, value, size=None) -> RopChain
+```
+
+Generates a ROP chain that performs bitwise OR on a memory location.
+
+<ParamField path="addr" type="int | RopValue" required>
+  Memory address to modify.
+</ParamField>
+
+<ParamField path="value" type="int | RopValue" required>
+  Value to OR with.
+</ParamField>
+
+<ParamField path="size" type="int | None">
+  Size of the operation in bytes.
+</ParamField>
+
+**Returns:** A [RopChain](/api/rop-chain) that performs `[addr] |= value`.
+
+### mem_and
+
+```python
+mem_and(addr, value, size=None) -> RopChain
+```
+
+Generates a ROP chain that performs bitwise AND on a memory location.
+
+<ParamField path="addr" type="int | RopValue" required>
+  Memory address to modify.
+</ParamField>
+
+<ParamField path="value" type="int | RopValue" required>
+  Value to AND with.
+</ParamField>
+
+<ParamField path="size" type="int | None">
+  Size of the operation in bytes.
+</ParamField>
+
+**Returns:** A [RopChain](/api/rop-chain) that performs `[addr] &= value`.
+
+## Function and System Calls
+
+### func_call
+
+```python
+func_call(address, args, preserve_regs=None, needs_return=True) -> RopChain
+```
+
+Generates a ROP chain that calls a function with specified arguments.
+
+<ParamField path="address" type="int | str" required>
+  Address or name of the function to call.
+</ParamField>
+
+<ParamField path="args" type="list | tuple" required>
+  List or tuple of arguments to pass to the function.
+</ParamField>
+
+<ParamField path="preserve_regs" type="set[str] | None">
+  Set of registers to preserve.
+</ParamField>
+
+<ParamField path="needs_return" type="bool" default="True">
+  Whether to continue the ROP chain after invoking the function.
+</ParamField>
+
+**Returns:** A [RopChain](/api/rop-chain) that invokes the function.
+
+**Example:**
+```python
+chain = rop.func_call('system', ['/bin/sh'])
+```
+
+### do_syscall
+
+```python
+do_syscall(syscall_num, args, needs_return=True, preserve_regs=None) -> RopChain
+```
+
+Generates a ROP chain that performs a system call.
+
+<ParamField path="syscall_num" type="int" required>
+  The syscall number to execute.
+</ParamField>
+
+<ParamField path="args" type="list" required>
+  List of register values to set before making the syscall.
+</ParamField>
+
+<ParamField path="needs_return" type="bool" default="True">
+  Whether to continue the ROP chain after the syscall.
+</ParamField>
+
+<ParamField path="preserve_regs" type="set[str] | None">
+  Set of registers to preserve.
+</ParamField>
+
+**Returns:** A [RopChain](/api/rop-chain) that makes the system call.
+
+**Example:**
+```python
+# execve syscall (59 on x86_64)
+chain = rop.do_syscall(59, ['/bin/sh', 0, 0])
+```
+
+### execve
+
+```python
+execve(path=None, path_addr=None) -> RopChain
+```
+
+Generates a ROP chain that executes the execve system call.
+
+<ParamField path="path" type="bytes | None">
+  Path of binary to execute. Defaults to `b"/bin/sh\x00"`.
+</ParamField>
+
+<ParamField path="path_addr" type="int | None">
+  Address where the path string should be stored.
+</ParamField>
+
+**Returns:** A [RopChain](/api/rop-chain) that executes execve.
+
+**Example:**
+```python
+chain = rop.execve()
+```
+
+### sigreturn
+
+```python
+sigreturn(**registers) -> RopChain
+```
+
+Generates a ROP chain that invokes sigreturn/rt_sigreturn and loads registers from a frame.
+
+<ParamField path="syscall_num" type="int | None">
+  Override syscall number if needed.
+</ParamField>
+
+<ParamField path="**registers" type="int">
+  Register values to set in the sigreturn frame.
+</ParamField>
+
+**Returns:** A [RopChain](/api/rop-chain) that performs sigreturn.
+
+### sigreturn_syscall
+
+```python
+sigreturn_syscall(syscall_num, args, sp=None) -> RopChain
+```
+
+Generates a sigreturn syscall chain with syscall gadget and ROP syscall registers.
+
+<ParamField path="syscall_num" type="int" required>
+  Syscall number for sigreturn.
+</ParamField>
+
+<ParamField path="args" type="list" required>
+  Syscall arguments for sigreturn.
+</ParamField>
+
+<ParamField path="sp" type="int | None">
+  Address to jump to after sigreturn.
+</ParamField>
+
+**Returns:** A [RopChain](/api/rop-chain) object.
+
+## Stack Operations
+
+### pivot
+
+```python
+pivot(thing) -> RopChain
+```
+
+Generates a ROP chain that performs a stack pivot.
+
+<ParamField path="thing" type="int | RopValue" required>
+  New stack pointer value or register containing it.
+</ParamField>
+
+**Returns:** A [RopChain](/api/rop-chain) that pivots the stack.
+
+### shift
+
+```python
+shift(length, preserve_regs=None, next_pc_idx=-1) -> RopChain
+```
+
+Generates a ROP chain to shift the stack pointer by a specific amount.
+
+<ParamField path="length" type="int" required>
+  Number of bytes to shift the stack pointer.
+</ParamField>
+
+<ParamField path="preserve_regs" type="set[str] | None">
+  Set of registers to preserve.
+</ParamField>
+
+<ParamField path="next_pc_idx" type="int" default="-1">
+  Index of the next PC value.
+</ParamField>
+
+**Returns:** A [RopChain](/api/rop-chain) that shifts the stack.
+
+### retsled
+
+```python
+retsled(size, preserve_regs=None) -> RopChain
+```
+
+Creates a ret-sled ROP chain where control flow is maintained regardless of entry point.
+
+<ParamField path="size" type="int" required>
+  Size of the retsled chain in bytes.
+</ParamField>
+
+<ParamField path="preserve_regs" type="set[str] | None">
+  Set of registers to preserve.
+</ParamField>
+
+**Returns:** A [RopChain](/api/rop-chain) consisting of ret gadgets.
+
+## Configuration Methods
+
+### set_badbytes
+
+```python
+set_badbytes(badbytes)
+```
+
+Updates the list of bad bytes to avoid in chains.
+
+<ParamField path="badbytes" type="list[int]" required>
+  List of 8-bit integers.
+</ParamField>
+
+### set_roparg_filler
+
+```python
+set_roparg_filler(roparg_filler)
+```
+
+Updates the filler value for useless register pops.
+
+<ParamField path="roparg_filler" type="int | None" required>
+  Filler value or None.
+</ParamField>
+
+### optimize
+
+```python
+optimize(processes=1)
+```
+
+Optimizes the chain builder by improving register setter and mover capabilities.
+
+<ParamField path="processes" type="int" default="1">
+  Number of processes to use for optimization.
+</ParamField>
+
+## Internal Methods
+
+### bootstrap
+
+```python
+bootstrap()
+```
+
+Initializes all internal chain building components. Called automatically after gadget discovery.
+
+### check_can_do_write
+
+```python
+check_can_do_write()
+```
+
+Checks whether the chain builder has the capability to write to memory. Sets internal `_can_do_write` flag.
+
+## Usage Through ROP Class
+
+All ChainBuilder methods are automatically exposed through the ROP class:
+
+```python
+import angr
+
+project = angr.Project('/bin/ls')
+rop = project.analyses.ROP()
+rop.find_gadgets()
+
+# All ChainBuilder methods are now available on rop
+chain1 = rop.set_regs(rax=0x1234)
+chain2 = rop.write_to_mem(0x8048000, b'data')
+chain3 = rop.func_call('system', ['/bin/sh'])
+
+# Chains can be combined
+full_chain = chain1 + chain2 + chain3
+```

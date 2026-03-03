@@ -1,0 +1,279 @@
+---
+title: 'GadgetFinder'
+description: 'Advanced API reference for the GadgetFinder class and gadget analysis internals'
+---
+
+## GadgetFinder Class
+
+The `GadgetFinder` class is responsible for discovering and analyzing ROP gadgets in binary executables. It performs both static analysis and symbolic execution to identify useful gadget candidates.
+
+### Constructor
+
+```python
+GadgetFinder(project, fast_mode=None, only_check_near_rets=True, 
+             max_block_size=None, max_sym_mem_access=None, is_thumb=False, 
+             kernel_mode=False, stack_gsize=80, cond_br=False, max_bb_cnt=2)
+```
+
+<ParamField path="project" type="angr.Project" required>
+  The angr project containing the binary to analyze
+</ParamField>
+
+<ParamField path="fast_mode" type="bool | None" default="None">
+  Enable fast mode to skip complex gadgets. If `None`, automatically decides based on binary size (enabled for binaries with >20,000 addresses to check). When enabled:
+  - Skips gadgets with conditional branches
+  - Skips floating point operations
+  - Skips jumps
+  - Reduces maximum block size
+  - Limits symbolic memory accesses to 1
+</ParamField>
+
+<ParamField path="only_check_near_rets" type="bool" default="True">
+  Only analyze blocks within `max_block_size` bytes of return instructions. Significantly speeds up analysis. Only applicable for i386/amd64/aarch64 architectures.
+</ParamField>
+
+<ParamField path="max_block_size" type="int | None" default="None">
+  Maximum size of blocks to consider as gadgets. Longer blocks are less likely to be useful ROP gadgets. If not specified, uses architecture default.
+</ParamField>
+
+<ParamField path="max_sym_mem_access" type="int | None" default="None">
+  Maximum number of symbolic memory accesses allowed in a gadget. Gadgets with more accesses are rejected. If not specified, uses architecture default.
+</ParamField>
+
+<ParamField path="is_thumb" type="bool" default="False">
+  Execute ROP chain in ARM Thumb mode. Only applicable for ARM architecture. angrop does not switch modes within a ROP chain.
+</ParamField>
+
+<ParamField path="kernel_mode" type="bool" default="False">
+  Find kernel mode gadgets. When enabled, searches in the `.text` section for kernel binaries.
+</ParamField>
+
+<ParamField path="stack_gsize" type="int" default="80">
+  Number of controllable gadgets on the stack. The maximum allowable stack change for gadgets is `stack_gsize * arch.bytes`.
+</ParamField>
+
+<ParamField path="cond_br" type="bool" default="False">
+  Whether to support conditional branches in gadgets. This option significantly impacts gadget finding speed.
+</ParamField>
+
+<ParamField path="max_bb_cnt" type="int" default="2">
+  Maximum number of basic blocks to traverse when analyzing a gadget.
+</ParamField>
+
+### Core Methods
+
+#### analyze_gadget
+
+```python
+def analyze_gadget(addr, allow_conditional_branches=None) -> RopGadget | list[RopGadget] | None
+```
+
+Analyze a single address for ROP gadgets.
+
+<ParamField path="addr" type="int" required>
+  The address to analyze for gadgets
+</ParamField>
+
+<ParamField path="allow_conditional_branches" type="bool | None" default="None">
+  Whether to allow gadgets with conditional branches. If `None`, uses the class-level `cond_br` setting.
+  - When `False`: Returns a single `RopGadget` or `None`
+  - When `True`: Returns a list of `RopGadget` instances (one per execution path)
+</ParamField>
+
+**Returns:** 
+- If `allow_conditional_branches=False`: Single gadget or `None`
+- If `allow_conditional_branches=True`: List of gadgets (empty list if none found)
+
+#### find_gadgets
+
+```python
+def find_gadgets(processes=4, show_progress=True, timeout=None) -> tuple[list[RopGadget], dict]
+```
+
+Find all gadgets in the binary using multiprocessing.
+
+<ParamField path="processes" type="int" default="4">
+  Number of worker processes to use for parallel analysis
+</ParamField>
+
+<ParamField path="show_progress" type="bool" default="True">
+  Display a progress bar during analysis
+</ParamField>
+
+<ParamField path="timeout" type="float | None" default="None">
+  Maximum time in seconds for gadget finding. Analysis stops when timeout is reached.
+</ParamField>
+
+**Returns:** A tuple of `(gadgets, duplicates)` where:
+- `gadgets`: Sorted list of all discovered ROP gadgets
+- `duplicates`: Dictionary mapping block hashes to sets of addresses with identical instructions
+
+#### find_gadgets_single_threaded
+
+```python
+def find_gadgets_single_threaded(show_progress=True) -> tuple[list[RopGadget], dict]
+```
+
+Find all gadgets using a single thread. Useful for debugging or when multiprocessing causes issues.
+
+**Returns:** Same as `find_gadgets()`
+
+#### analyze_gadget_list
+
+```python
+def analyze_gadget_list(addr_list, processes=4, show_progress=True) -> list[RopGadget]
+```
+
+Analyze a specific list of addresses for gadgets.
+
+<ParamField path="addr_list" type="list[int]" required>
+  List of addresses to analyze
+</ParamField>
+
+**Returns:** List of discovered gadgets from the provided addresses
+
+### Internal Analysis Pipeline
+
+#### Static Analysis Phase
+
+The gadget finder uses a two-phase approach:
+
+1. **Static Filtering** (`_multiprocess_static_analysis`)
+   - Loads and disassembles blocks near return instructions
+   - Filters based on:
+     - Block size (`max_block_size`)
+     - Jump kind (ret, syscall, boring, call)
+     - Conditional branches (if `cond_br=False`)
+     - Floating point operations (if `fast_mode=True`)
+     - Valid jump targets
+   - Builds cache of block hashes to deduplicate identical instruction sequences
+
+2. **Symbolic Analysis Phase** (`_analyze_gadgets_multiprocess`)
+   - Symbolically executes each unique gadget candidate
+   - Timeout per gadget: 3 seconds
+   - Worker processes automatically restart if memory usage exceeds 500MB
+
+#### Block Validation
+
+Blocks are validated through multiple checks:
+
+```python
+# VEX-level checks (_block_make_sense_vex)
+- No floating point types (Ity_F16, Ity_F32, Ity_F64, Ity_F128, Ity_V128)
+- No SIMD types (Ity_V128)
+- No Dirty statements (inline assembly)
+- No division operations (Iop_Div*)
+- Constant memory accesses must be in valid segments
+
+# Symbolic memory access checks (_block_make_sense_sym_access)
+- Count non-word-sized memory accesses per instruction
+- Reject if count exceeds max_sym_mem_access
+```
+
+### Block Hashing and Deduplication
+
+```python
+def block_hash(block) -> bytes
+```
+
+Generates a hash to uniquely identify gadgets with identical instructions.
+
+- For regular gadgets: Uses raw bytes of the block
+- For syscall gadgets: Includes bytes of the next block after the syscall
+
+Duplicate gadgets are stored in `_duplicates` dictionary and can be used to avoid bad bytes.
+
+### Address Generation
+
+The `_slices_to_check()` method generates address ranges to analyze:
+
+- **With `only_check_near_rets=True`**: 
+  - Creates slices of `max_block_size` bytes before each return instruction
+  - Merges overlapping slices to avoid redundant analysis
+  - Prioritizes syscall locations for early discovery
+
+- **With `only_check_near_rets=False`**:
+  - Analyzes all executable memory ranges
+  - Respects alignment boundaries
+
+### Multiprocessing Architecture
+
+The finder uses two worker functions:
+
+```python
+# Phase 1: Static analysis
+worker_func1(cslice)
+  - Processes address slices
+  - Performs fast block-level filtering
+  - Returns (address, block_hash) tuples
+
+# Phase 2: Symbolic analysis  
+worker_func2(addr, cond_br=None)
+  - Analyzes individual gadgets
+  - 3-second timeout per gadget
+  - Automatic worker restart on memory leaks
+```
+
+### Location Discovery
+
+#### Return Instruction Locations
+
+```python
+def _get_ret_locations() -> list[int]
+```
+
+Finds all return instructions in the binary:
+- Uses architecture-specific byte patterns (fast path for x86/x64/aarch64/riscv)
+- Falls back to VEX jumpkind analysis for other architectures
+- Returns sorted list of return instruction addresses
+
+#### Syscall Instruction Locations
+
+```python
+def _get_syscall_locations() -> list[int]
+```
+
+Finds all syscall instructions:
+- Searches for architecture-specific syscall byte patterns
+- Supported: i386, amd64, MIPS
+- Returns sorted list of syscall instruction addresses
+
+### Performance Considerations
+
+- **Fast Mode**: Automatically enabled for large binaries (>20k addresses)
+- **Worker Memory Management**: Processes restart when RSS exceeds 500MB over baseline
+- **Timeout Handling**: 3-second per-gadget timeout prevents hangs
+- **Cache Optimization**: Deduplicates identical blocks to reduce symbolic execution
+
+### Example Usage
+
+```python
+import angr
+from angrop.gadget_finder import GadgetFinder
+
+project = angr.Project('/bin/ls')
+
+# Create finder with custom settings
+finder = GadgetFinder(
+    project,
+    fast_mode=True,
+    max_block_size=20,
+    max_sym_mem_access=2,
+    cond_br=False,
+    stack_gsize=100
+)
+
+# Analyze a specific address
+gadget = finder.analyze_gadget(0x401000)
+if gadget:
+    print(f"Found gadget: {gadget}")
+
+# Find all gadgets
+gadgets, duplicates = finder.find_gadgets(processes=8, timeout=300)
+print(f"Found {len(gadgets)} gadgets")
+print(f"Found {len(duplicates)} duplicate patterns")
+
+# Analyze specific addresses
+addrs = [0x401000, 0x401010, 0x401020]
+custom_gadgets = finder.analyze_gadget_list(addrs)
+```

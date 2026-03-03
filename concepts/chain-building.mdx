@@ -1,0 +1,329 @@
+---
+title: Chain Building
+description: How angrop automatically constructs ROP chains
+---
+
+## Overview
+
+angrop's chain builder automatically assembles ROP gadgets into functional exploit chains. Rather than manually selecting and linking gadgets, you specify high-level goals ("set rax to 0x1234", "write data to memory", "call execve") and angrop finds the optimal gadget sequence.
+
+## Architecture
+
+The chain builder consists of specialized modules, each responsible for different types of operations:
+
+### Core Modules
+
+From `chain_builder/__init__.py:42-53`:
+
+```python
+self._reg_setter = RegSetter(self)      # Set registers to values
+self._reg_mover = RegMover(self)        # Move data between registers  
+self._mem_writer = MemWriter(self)      # Write data to memory
+self._mem_changer = MemChanger(self)    # Modify memory in-place
+self._func_caller = FuncCaller(self)    # Call functions
+self._sys_caller = SysCaller(self)      # Invoke syscalls
+self._sigreturn = SigreturnBuilder(self) # Build sigreturn frames
+self._pivot = Pivot(self)               # Pivot the stack
+self._shifter = Shifter(self)           # Adjust stack pointer
+```
+
+Each module:
+1. **Bootstraps** by analyzing available gadgets and building internal data structures
+2. **Optimizes** by finding better gadget combinations
+3. **Generates chains** on demand using graph search and constraint solving
+
+## The RegSetter Module
+
+The most fundamental module. Sets registers to arbitrary values using graph search.
+
+### Graph Search Algorithm
+
+From `reg_setter.py:474-612`, RegSetter builds a directed graph where:
+
+- **Nodes**: States representing which registers have been set to target values
+- **Edges**: Gadgets that transition between states
+
+**Example**: To set `rax=0x1234` and `rbx=0x5678`:
+
+```
+(False, False)  →  (True, False)  →  (True, True)
+    ↓                   ↓                  ↓
+  Neither          rax set          Both set
+```
+
+Edges are gadgets like:
+- `pop rax; ret` - Sets rax
+- `pop rbx; pop r12; ret` - Sets rbx (and r12)
+- `pop rax; pop rbx; ret` - Sets both at once
+
+### Register Setting Strategy
+
+From `reg_setter.py:749-777`:
+
+```python
+def run(self, preserve_regs=None, warn=True, **registers):
+    # 1. Handle "hard" registers (can't pop, or contain badbytes)
+    hard_chain = self._handle_hard_regs(gadgets, registers, preserve_regs)
+    
+    # 2. Build graph and search for paths
+    chains = self.find_candidate_chains_giga_graph_search(
+        modifiable_memory_range, registers, preserve_regs, warn)
+    
+    # 3. Try each candidate chain
+    for gadgets in chains:
+        chain = self._build_reg_setting_chain(gadgets, registers)
+        if self.verify(chain, preserve_regs, registers):
+            return chain
+```
+
+**Hard registers** are handled specially:
+- Registers containing badbytes: Use arithmetic gadgets to construct the value
+- Unpoppable registers: Use register moves or memory reads
+
+### Concrete Value Crafting
+
+When a register can't be popped directly, angrop crafts the value using arithmetic:
+
+From `reg_setter.py:699-725`:
+```python
+def _find_add_chain(self, reg, val):
+    # Find chain like: pop rax; ret + add rax, 0x1000; ret
+    for g1 in concrete_setter_gadgets:
+        for g2 in delta_gadgets:
+            init_ast, final_ast = g2.concrete_reg_changes[reg]
+            # Check if g1's value + g2's delta == target value
+```
+
+Example: To set `rax = 0x41424344` (contains null bytes):
+1. `pop rax; ret` with value `0x41424300`
+2. `add rax, 0x44; ret`
+3. Result: `rax = 0x41424344` (no null bytes in payload)
+
+## The MemWriter Module  
+
+Writes arbitrary data to memory addresses.
+
+### Basic Memory Writing
+
+From `mem_writer.py:464-492`:
+
+```python
+def _write_to_mem(self, addr, string_data, preserve_regs, fill_byte):
+    # 1. Find gadgets with controllable memory writes
+    for gadget in self._gen_mem_write_gadgets(string_data, key):
+        mem_write = gadget.mem_writes[0]
+        
+        # 2. Set up registers to control address and data
+        reg_vals = {}
+        for reg in mem_write.addr_dependencies:
+            reg_vals[reg] = addr_value
+        for reg in mem_write.data_dependencies:
+            reg_vals[reg] = data_value
+            
+        # 3. Build chain: set_regs + memory_write_gadget
+        chain = self.set_regs(**reg_vals, preserve_regs=preserve_regs)
+        chain += RopBlock.from_gadget(gadget)
+```
+
+**Gadget selection criteria** (from mem_writer.py:358-375):
+1. Self-contained
+2. Exactly one memory write
+3. Address and data independently controllable
+4. No symbolic memory reads
+
+### Handling Badbytes
+
+When data contains badbytes, angrop uses memory modification gadgets:
+
+From `mem_writer.py:631-661`:
+```python
+def _try_write_plan(self, plan, addr, data, preserve_regs, fill_byte):
+    # Try to transform data to avoid badbytes:
+    for init_blob, op, arg in self._find_chunk_transforms(chunk, badbytes):
+        # Write safe initial value
+        chain = self._write_to_mem(ptr, init_blob)
+        # Modify memory to get target value
+        chain += self.mem_xor(ptr, arg)  # or mem_add, mem_or, mem_and
+```
+
+**Example**: Writing `\x00\x41\x42\x43` with `\x00` as badbyte:
+1. Write `\x01\x41\x42\x43` (no badbytes)
+2. Execute `xor dword [rax], 0x00000001`
+3. Result: `\x00\x41\x42\x43`
+
+## The MemChanger Module
+
+Modifies memory in-place using arithmetic/logical operations.
+
+Supported operations:
+- `mem_add(addr, value)` - `[addr] += value`
+- `mem_xor(addr, value)` - `[addr] ^= value`  
+- `mem_or(addr, value)` - `[addr] |= value`
+- `mem_and(addr, value)` - `[addr] &= value`
+
+These are used both for crafting values and for direct exploitation.
+
+## The FuncCaller Module
+
+Invokes functions with specified arguments, handling calling conventions.
+
+From the ChainBuilder API:
+```python
+def func_call(self, address, args, preserve_regs=None, needs_return=True):
+    # Automatically handles calling convention:
+    # - x86: Arguments on stack
+    # - x64: Arguments in rdi, rsi, rdx, rcx, r8, r9, then stack
+    # - ARM: Arguments in r0-r3, then stack
+```
+
+## The SysCaller Module  
+
+Builds syscall invocation chains.
+
+From `chain_builder/__init__.py:138-152`:
+```python
+def do_syscall(self, syscall_num, args, needs_return=True):
+    # Sets up syscall registers:
+    # - x86: eax=syscall_num, ebx, ecx, edx, esi, edi, ebp
+    # - x64: rax=syscall_num, rdi, rsi, rdx, r10, r8, r9
+    # Then executes syscall gadget
+```
+
+**Special case**: `execve` chains
+```python
+def execve(self, path=b"/bin/sh\x00", path_addr=None):
+    # 1. Write path string to writable memory
+    # 2. Set syscall registers (rax=59, rdi=path_addr, rsi=0, rdx=0)
+    # 3. Execute syscall gadget
+```
+
+## Chain Composition
+
+Chains are built incrementally and can be combined:
+
+### RopChain Objects
+
+From usage:
+```python
+# Create individual chains
+chain1 = rop.set_regs(rax=0x1234)
+chain2 = rop.set_regs(rbx=0x5678)  
+chain3 = rop.write_to_mem(0x601000, b"Hello")
+
+# Combine chains
+full_chain = chain1 + chain2 + chain3
+
+# Generate payload
+payload = full_chain.payload_str()
+full_chain.print_payload_code()
+```
+
+### RopBlock Normalization
+
+Complex gadgets are wrapped in RopBlocks that encapsulate:
+- The gadget sequence
+- Required stack values
+- Symbolic constraints
+- Register preservation requirements
+
+From `builder.py:879-956`:
+```python
+def normalize_gadget(self, gadget):
+    # Converts raw gadget into usable RopBlock:
+    # 1. Handle conditional branches
+    # 2. Normalize transit type (jmp_reg, jmp_mem)
+    # 3. Add stack shifters if needed
+    # 4. Constrain symbolic memory accesses
+```
+
+## Optimization
+
+The chain builder optimizes iteratively:
+
+From `chain_builder/__init__.py:232-244`:
+```python
+def optimize(self, processes=1):
+    again = True
+    cnt = 0
+    while again and cnt < 5:
+        # Try to improve reg_mover
+        again = self._reg_mover.optimize(processes=processes)
+        # Try to improve reg_setter  
+        again |= self._reg_setter.optimize(processes=processes)
+        cnt += 1
+```
+
+**Optimization strategies**:
+1. **Register moves**: Find ways to set hard registers by moving from easy ones
+2. **Gadget normalization**: Make non-self-contained gadgets usable
+3. **Chain shortening**: Replace long chains with shorter equivalent ones
+
+## Constraint Solving
+
+The chain builder uses symbolic execution and constraint solving throughout:
+
+### Building Reg Setting Chains
+
+From `builder.py:362-556`:
+```python
+def _build_reg_setting_chain(self, gadgets, register_dict):
+    # 1. Create symbolic state
+    test_symbolic_state = make_symbolic_state(self.project, ...)
+    
+    # 2. Step through each gadget symbolically
+    for gadget in gadgets:
+        state = step_to_unconstrained_successor(state)
+    
+    # 3. Constrain final register values
+    for reg, val in register_dict.items():
+        state.solver.add(state.regs[reg] == val)
+    
+    # 4. Solve for required stack values
+    chain = RopChain(self.project, state=test_symbolic_state)
+```
+
+### Rebalancing Constraints
+
+When gadgets transform values, angrop "rebalances" constraints:
+
+From `builder.py:245-359`:
+```python
+def _rebalance_ast(self, lhs, rhs):
+    # Given: stack_value + 0x1000 == user_value
+    # Solve: stack_value == user_value - 0x1000
+    # Supports: add, sub, xor, and, or, shifts, extracts
+```
+
+This allows using gadgets like `pop rax; add rax, 0x10; ret` transparently.
+
+## Example: Building a Complete Chain
+
+```python
+import angr
+import angrop
+
+p = angr.Project("/bin/vulnerable")
+rop = p.analyses.ROP()
+rop.find_gadgets()
+
+# High-level chain construction
+chain = rop.write_to_mem(0x601000, b"/bin/sh\x00")
+chain += rop.func_call("system", [0x601000])
+
+# angrop automatically:
+# 1. Finds memory write gadgets
+# 2. Sets up address and data registers  
+# 3. Writes the string
+# 4. Sets up argument registers per calling convention
+# 5. Calls system()
+
+print(chain.payload_str().hex())
+chain.print_payload_code()
+```
+
+The chain builder handles all the complexity:
+- Gadget selection and ordering
+- Register allocation and preservation
+- Constraint solving for stack values
+- Calling convention adherence
+- Badbyte avoidance

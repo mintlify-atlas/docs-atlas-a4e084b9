@@ -1,0 +1,224 @@
+---
+title: ROP Gadgets
+description: Understanding ROP gadgets and their types in angrop
+---
+
+## What are ROP Gadgets?
+
+Return-Oriented Programming (ROP) gadgets are small sequences of executable instructions ending in a return instruction (or similar control flow transfer). These gadgets are chained together to perform arbitrary computation by controlling the stack and hijacking the normal program flow.
+
+In angrop, gadgets are discovered through symbolic execution and analyzed to understand their effects on registers, memory, and control flow.
+
+## Gadget Types
+
+angrop categorizes gadgets into several types based on their functionality:
+
+### RopGadget
+
+The base gadget type used for general-purpose ROP operations. A `RopGadget` represents a sequence of instructions that can be used to manipulate registers, memory, or control flow.
+
+**Key properties:**
+- `addr`: The address where the gadget starts
+- `stack_change`: How much the stack pointer changes after execution
+- `changed_regs`: Set of registers modified by the gadget
+- `reg_pops`: Registers that are popped from the stack
+- `reg_moves`: Register-to-register data movements
+- `mem_reads`, `mem_writes`, `mem_changes`: Memory access operations
+- `bbl_addrs`: List of basic block addresses in the gadget
+
+**Transit types:**
+
+Gadgets have different ways of transferring control:
+
+1. **pop_pc** - Returns normally (e.g., `ret`, `pop pc`). These are "self-contained" gadgets.
+2. **jmp_reg** - Jumps to a register value (e.g., `jmp rax`, `call rbx`)
+3. **jmp_mem** - Jumps to a memory location (e.g., `jmp [rax+8]`, `call [rbp+0x10]`)
+
+Example from source:
+```python
+# A gadget like "mov rax, [rsp]; add rsp, 8; jmp rax" 
+# is considered pop_pc even though it uses jmp
+gadget.transit_type = 'pop_pc'
+gadget.pc_offset = stack_change - arch.bytes
+```
+
+### PivotGadget
+
+Stack pivot gadgets allow you to change the stack pointer to an arbitrary location. This is essential for exploits where you need to move execution to a controlled memory region.
+
+**Key properties:**
+- `stack_change_before_pivot`: Stack change before the pivot occurs
+- `stack_change_after_pivot`: Stack change after the pivot
+- `sp_reg_controllers`: Registers that can control the new stack pointer value
+- `sp_stack_controllers`: Stack values that control the new stack pointer
+
+**Definition:**
+A PivotGadget can arbitrarily control the stack pointer register and performs the pivot exactly once.
+
+Example pivot gadgets:
+- `mov rsp, rbp; ret`
+- `xchg rsp, rax; ret`
+- `pop rsp; ret`
+
+### SyscallGadget
+
+Gadgets that invoke system calls, enabling direct interaction with the operating system kernel.
+
+**Two types:**
+
+1. **With return**: `syscall; ret` - Can continue the ROP chain after the syscall
+2. **Without return**: `syscall; <other instructions>` - Terminal gadgets that don't return control
+
+**Key properties:**
+- `can_return`: Whether the gadget returns after the syscall
+- `prologue`: Optional setup gadget executed before the syscall
+
+**Architecture-specific syscall instructions:**
+- x86: `int 0x80`
+- x64: `syscall`
+- ARM/MIPS: `syscall`
+
+From arch.py:
+```python
+class X86(ROPArch):
+    self.syscall_insts = {b"\xcd\x80"}  # int 0x80
+
+class AMD64(X86):
+    self.syscall_insts = {b"\x0f\x05"}  # syscall
+```
+
+### FunctionGadget
+
+Represents a function call that can be used in ROP chains.
+
+**Key properties:**
+- `symbol`: The function symbol name (e.g., "system", "execve")
+- Used for invoking library functions like `system("/bin/sh")`
+
+## Self-Contained vs Non-Self-Contained Gadgets
+
+### Self-Contained Gadgets
+
+Gadgets that can be used independently without requiring other gadgets to set up their execution.
+
+**Criteria** (from rop_gadget.py:34):
+```python
+@property
+def self_contained(self):
+    return (not self.has_conditional_branch and 
+            self.transit_type == 'pop_pc' and 
+            not self.oop)
+```
+
+A gadget is self-contained if:
+- It has no conditional branches
+- It uses `pop_pc` transit type (normal return)
+- It has no out-of-patch (oop) memory accesses
+
+Examples:
+- `pop rax; ret` ✓ Self-contained
+- `pop rax; pop rbx; ret` ✓ Self-contained
+- `mov rax, [rsp]; add rsp, 8; jmp rax` ✓ Self-contained (treated as pop_pc)
+
+### Non-Self-Contained Gadgets
+
+Gadgets that require setup or normalization before use.
+
+**Examples:**
+
+1. **jmp_reg gadgets** - Require setting the target register first:
+   ```asm
+   mov rax, rbx; jmp rax
+   ```
+   Needs another gadget to set `rax` before jumping.
+
+2. **jmp_mem gadgets** - Require setting up memory:
+   ```asm
+   call [rax+0x10]
+   ```
+   Needs to write the target address to `[rax+0x10]`.
+
+3. **Conditional branch gadgets**:
+   ```asm
+   test rax, rax; jz skip; pop rbx; skip: ret
+   ```
+   Requires setting `rax` to control the branch.
+
+**Normalization:**
+
+angrop can "normalize" non-self-contained gadgets by prepending setup gadgets. From builder.py:821:
+```python
+def normalize_gadget(self, gadget, pre_preserve=None, 
+                     post_preserve=None, to_set_regs=None):
+    # Converts non-self-contained gadgets into usable RopBlocks
+    # by adding necessary setup chains
+```
+
+This allows angrop to use more complex gadgets by automatically building the required setup chain.
+
+## Gadget Effects
+
+angrop analyzes each gadget to understand its effects:
+
+**Register effects:**
+- `changed_regs`: All modified registers
+- `popped_regs`: Registers loaded from the stack
+- `reg_moves`: Register-to-register copies
+- `reg_dependencies`: Which registers affect other registers
+- `reg_controllers`: Which registers can fully control other registers
+- `concrete_regs`: Registers set to concrete values
+
+**Memory effects:**
+- `mem_reads`: Memory load operations
+- `mem_writes`: Memory store operations  
+- `mem_changes`: In-place memory modifications (add, xor, etc.)
+
+**Control flow:**
+- `transit_type`: How control is transferred
+- `has_conditional_branch`: Whether execution path depends on register values
+- `branch_dependencies`: Registers that affect branch decisions
+
+## Finding Gadgets
+
+Gadgets are discovered through several methods:
+
+1. **Near-ret scanning**: Searching backwards from return instructions
+2. **Symbolic execution**: Analyzing instruction sequences to determine effects
+3. **Constraint solving**: Understanding what values enable desired effects
+
+Example usage:
+```python
+import angr
+import angrop
+
+p = angr.Project("/bin/ls")
+rop = p.analyses.ROP()
+rop.find_gadgets()
+
+# Access discovered gadgets
+for gadget in rop.rop_gadgets:
+    if gadget.self_contained:
+        print(f"{gadget.addr:#x}: {gadget.dstr()}")
+```
+
+## Gadget Selection
+
+When building chains, angrop selects gadgets based on:
+
+1. **Stack change** - Smaller is better (less payload size)
+2. **Side effects** - Fewer modified registers is better
+3. **Symbolic memory accesses** - Fewer is better (easier to constrain)
+4. **Instruction count** - Shorter gadgets are simpler
+5. **Conditional branches** - Avoided when possible (harder to control)
+
+From builder.py:578:
+```python
+def _comparison_tuple(self, g):
+    return (len(g.changed_regs-regs_to_set), 
+            g.stack_change, 
+            g.num_sym_mem_access,
+            g.isn_count, 
+            int(g.has_conditional_branch is True))
+```
+
+This ordering ensures angrop builds efficient, reliable ROP chains.

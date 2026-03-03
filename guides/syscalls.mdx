@@ -1,0 +1,458 @@
+---
+title: System Calls
+description: Make Linux system calls and spawn shells using angrop's syscall support
+---
+
+Angrop provides powerful methods to invoke Linux system calls directly, including a convenient `execve()` wrapper for spawning shells. This guide covers syscall invocation and common exploitation patterns.
+
+## Making System Calls: `do_syscall()`
+
+The `do_syscall()` method generates ROP chains that invoke Linux system calls with proper register setup.
+
+### Method Signature
+
+```python
+rop.do_syscall(syscall_num, args, needs_return=True, preserve_regs=None)
+```
+
+**Parameters:**
+- `syscall_num`: The syscall number to invoke (integer)
+- `args`: List or tuple of arguments for the syscall
+- `needs_return`: Whether execution should continue after the syscall (default: `True`)
+- `preserve_regs`: Set of registers that should not be modified
+
+**Returns:** A `RopChain` that invokes the system call
+
+### Basic Examples
+
+<Steps>
+  <Step title="Invoke a simple syscall">
+    ```python
+    import angr
+    import angrop
+
+    proj = angr.Project("/bin/bash")
+    rop = proj.analyses.ROP()
+    rop.find_gadgets()
+
+    # Invoke read(0, 0x804f000, 0x100) - syscall number 0 on x64
+    chain = rop.do_syscall(0, [0, 0x804f000, 0x100])
+    chain.pp()
+    ```
+  </Step>
+
+  <Step title="Invoke without returning">
+    ```python
+    # Invoke exit(0) - syscall number 60 on x64
+    chain = rop.do_syscall(60, [0], needs_return=False)
+    ```
+  </Step>
+
+  <Step title="Invoke execve">
+    ```python
+    # execve("/bin/sh", NULL, NULL) - syscall number 59 on x64
+    chain = rop.write_to_mem(0x61b100, b"/bin/sh\x00")
+    chain += rop.do_syscall(59, [0x61b100, 0, 0], needs_return=False)
+    ```
+  </Step>
+</Steps>
+
+<Note>
+Syscall numbers vary by architecture:
+- x86_64: execve=59, read=0, write=1, open=2, exit=60
+- x86 (32-bit): execve=11, read=3, write=4, open=5, exit=1
+- ARM: execve=11, read=3, write=4, open=5, exit=1
+
+Check `/usr/include/asm/unistd_64.h` or similar headers for your architecture.
+</Note>
+
+## Syscall Calling Convention
+
+### x86_64 Linux
+
+Arguments are passed in registers:
+1. `rax` - Syscall number
+2. `rdi` - First argument
+3. `rsi` - Second argument
+4. `rdx` - Third argument
+5. `r10` - Fourth argument (note: not rcx!)
+6. `r8` - Fifth argument
+7. `r9` - Sixth argument
+
+The syscall instruction is: `syscall`
+
+```python
+# Example: read(0, buf, 100)
+chain = rop.do_syscall(0, [0, 0x804f000, 100])
+# Sets: rax=0, rdi=0, rsi=0x804f000, rdx=100
+# Executes: syscall
+```
+
+### x86 (32-bit) Linux
+
+Arguments are passed in registers:
+1. `eax` - Syscall number
+2. `ebx` - First argument
+3. `ecx` - Second argument  
+4. `edx` - Third argument
+5. `esi` - Fourth argument
+6. `edi` - Fifth argument
+7. `ebp` - Sixth argument
+
+The syscall instruction is: `int 0x80`
+
+```python
+# Example: write(1, buf, 100)
+chain = rop.do_syscall(4, [1, 0x804f000, 100])
+# Sets: eax=4, ebx=1, ecx=0x804f000, edx=100
+# Executes: int 0x80
+```
+
+## Spawning a Shell: `execve()`
+
+The `execve()` method is a convenience wrapper that writes "/bin/sh" to memory and invokes the execve syscall.
+
+### Method Signature
+
+```python
+rop.execve(path=None, path_addr=None)
+```
+
+**Parameters:**
+- `path`: Custom path to execute (default: `b"/bin/sh\x00"`)
+- `path_addr`: Memory address to write the path (default: auto-selected writable region)
+
+**Returns:** A `RopChain` that spawns a shell
+
+### Basic Example
+
+```python
+import angr
+import angrop
+
+proj = angr.Project("/bin/bash")
+rop = proj.analyses.ROP()
+rop.find_gadgets()
+
+# Spawn /bin/sh using default settings
+chain = rop.execve()
+chain.pp()
+```
+
+This automatically:
+1. Finds a writable memory region
+2. Writes `/bin/sh\x00` to memory
+3. Invokes `execve("/bin/sh", NULL, NULL)`
+
+### Custom Shell Path
+
+```python
+# Execute a different shell
+chain = rop.execve(path=b"/bin/zsh\x00")
+
+# Execute a custom binary
+chain = rop.execve(path=b"/tmp/backdoor\x00")
+```
+
+### Specify Memory Location
+
+```python
+# Write to specific address
+chain = rop.execve(path_addr=0x61b100)
+
+# Or write the path yourself first
+chain = rop.write_to_mem(0x61b100, b"/bin/sh\x00")
+chain += rop.execve(path_addr=0x61b100)
+```
+
+<Tip>
+If you don't specify `path_addr`, angrop automatically searches for a writable region in the binary's memory. This is convenient but you can also specify an address if you know a good location.
+</Tip>
+
+## Real-World Syscall Examples
+
+### Example 1: Read-Write Chain
+
+```python
+import angr
+import angrop
+
+proj = angr.Project("/bin/bash")
+rop = proj.analyses.ROP()
+rop.find_gadgets()
+
+# Read from stdin into buffer
+chain = rop.do_syscall(0, [0, 0x804f000, 0x100])
+
+# Write buffer to stdout
+chain += rop.do_syscall(1, [1, 0x804f000, 0x100])
+
+# Exit cleanly
+chain += rop.do_syscall(60, [0], needs_return=False)
+```
+
+### Example 2: Open-Read-Write File
+
+```python
+import angr
+import angrop
+
+proj = angr.Project("/bin/bash")
+rop = proj.analyses.ROP()
+rop.find_gadgets()
+
+# Write filename
+chain = rop.write_to_mem(0x61b100, b"flag.txt\x00")
+
+# Open file - syscall 2 on x64 (open)
+chain += rop.do_syscall(2, [0x61b100, 0, 0])  # O_RDONLY = 0
+
+# Read from fd (return value in rax)
+chain += rop.move_regs(rdi='rax')
+chain += rop.set_regs(rsi=0x61b200, rdx=0x100, preserve_regs={'rdi'})
+chain += rop.do_syscall(0, [], preserve_regs={'rdi', 'rsi', 'rdx'})
+
+# Write to stdout
+chain += rop.do_syscall(1, [1, 0x61b200, 0x100])
+```
+
+### Example 3: Execve with Arguments
+
+```python
+import struct
+import angr
+import angrop
+
+proj = angr.Project("/bin/bash")
+rop = proj.analyses.ROP()
+rop.find_gadgets()
+
+# Build argv array: ["/bin/sh", "-c", "cat flag", NULL]
+argv_base = 0x61b100
+arg0_addr = 0x61b200
+arg1_addr = 0x61b210
+arg2_addr = 0x61b220
+
+# Write strings
+chain = rop.write_to_mem(arg0_addr, b"/bin/sh\x00")
+chain += rop.write_to_mem(arg1_addr, b"-c\x00")
+chain += rop.write_to_mem(arg2_addr, b"cat flag\x00")
+
+# Write argv pointer array
+chain += rop.write_to_mem(argv_base, struct.pack('<Q', arg0_addr))
+chain += rop.write_to_mem(argv_base + 8, struct.pack('<Q', arg1_addr))
+chain += rop.write_to_mem(argv_base + 16, struct.pack('<Q', arg2_addr))
+chain += rop.write_to_mem(argv_base + 24, struct.pack('<Q', 0))  # NULL
+
+# execve("/bin/sh", argv, NULL)
+chain += rop.do_syscall(59, [arg0_addr, argv_base, 0], needs_return=False)
+```
+
+<Note>
+When using syscalls directly, you have more control than library functions but need to handle setup manually. The execve example above shows building a proper argv array.
+</Note>
+
+## Syscall Gadget Requirements
+
+For syscalls to work, angrop needs gadgets ending in:
+- `syscall; ret` (x86_64)
+- `int 0x80; ret` (x86)
+- `svc #0; ret` (ARM)
+
+You can check if syscall gadgets were found:
+
+```python
+rop.find_gadgets()
+
+if not rop.syscall_gadgets:
+    print("No syscall gadgets found!")
+else:
+    print(f"Found {len(rop.syscall_gadgets)} syscall gadgets")
+    for g in rop.syscall_gadgets[:3]:
+        print(f"  {hex(g.addr)}: {g}")
+```
+
+<Tip>
+If no syscall gadgets are found, you may need to:
+1. Use `fast_mode=False` when initializing ROP
+2. Check if the binary actually contains syscall instructions
+3. Fall back to using `func_call()` with library functions instead
+</Tip>
+
+## Handling Syscall Return Values
+
+Like function calls, syscall return values go in `rax` (x64) or `eax` (x86):
+
+```python
+# Open returns file descriptor in rax
+chain = rop.do_syscall(2, [0x61b100, 0, 0])
+
+# Save fd to another register
+chain += rop.move_regs(r12='rax')
+
+# Later use the saved fd
+chain += rop.move_regs(rdi='r12')
+chain += rop.do_syscall(0, [], preserve_regs={'rdi'})  # read(fd, ...)
+```
+
+## Common Syscall Numbers
+
+### x86_64 Linux
+
+```python
+# Common syscalls
+SYS_read = 0
+SYS_write = 1
+SYS_open = 2
+SYS_close = 3
+SYS_mmap = 9
+SYS_mprotect = 10
+SYS_execve = 59
+SYS_exit = 60
+
+# Use them in your exploit
+chain = rop.do_syscall(SYS_open, [filename, 0])
+```
+
+### x86 (32-bit) Linux
+
+```python
+SYS_exit = 1
+SYS_fork = 2
+SYS_read = 3
+SYS_write = 4
+SYS_open = 5
+SYS_close = 6
+SYS_execve = 11
+```
+
+## Advanced: Kernel Mode Syscalls
+
+Angrop supports kernel-mode ROP for Linux kernel exploitation:
+
+```python
+import angr
+import angrop
+
+proj = angr.Project("./vmlinux_sym")
+rop = proj.analyses.ROP(kernel_mode=True)
+rop.find_gadgets()
+
+# In kernel mode, you call kernel functions directly
+init_cred = 0xffffffff8368b220
+chain = rop.func_call("commit_creds", [init_cred])
+chain += rop.func_call("__x64_sys_fork", [])
+```
+
+See the [Kernel ROP](/guides/kernel-rop) guide for details.
+
+## Badbytes and Syscalls
+
+When badbytes are configured, angrop avoids them in syscall numbers and arguments:
+
+```python
+import angr
+import angrop
+
+proj = angr.Project("/bin/bash")
+rop = proj.analyses.ROP()
+rop.set_badbytes([0x00, 0x0a])  # Null and newline
+rop.find_gadgets()
+
+# If syscall number contains badbytes, angrop constructs it
+chain = rop.do_syscall(0x0a, [1, 2, 3])  # 0x0a is a badbyte
+# Angrop will use arithmetic: set rax=0x0b, then dec rax
+```
+
+<Note>
+If your syscall arguments contain badbytes (like NULL pointers), angrop will use arithmetic operations to construct them, similar to how it handles badbytes in `set_regs()`.
+</Note>
+
+## Error Handling
+
+### No Syscall Gadgets
+
+```python
+from angrop.errors import RopException
+
+try:
+    chain = rop.do_syscall(59, [0x61b100, 0, 0])
+except RopException as e:
+    if "does not contain syscall gadget" in str(e):
+        print("No syscall gadgets found, using library call instead")
+        chain = rop.func_call("execve", [0x61b100, 0, 0])
+```
+
+### Cannot Set Syscall Number
+
+From the source code (`sys_caller.py:134-165`), if angrop can't set the syscall number register:
+
+```python
+# Angrop will try to find gadgets with concrete syscall numbers
+# Example: If there's a gadget that already has rax=59 (execve)
+# it will use that instead of trying to set rax
+```
+
+## Complete Exploit Example
+
+Here's a full exploit using syscalls:
+
+```python
+import angr
+import angrop
+
+proj = angr.Project("./vulnerable_binary")
+rop = proj.analyses.ROP()
+rop.set_badbytes([0x00, 0x0a])  # Avoid nulls and newlines
+rop.find_gadgets()
+
+# Stage 1: Read shellcode from stdin
+shellcode_addr = 0x61b000
+chain = rop.do_syscall(0, [0, shellcode_addr, 0x1000])  # read
+
+# Stage 2: Make it executable
+# mprotect(addr, len, PROT_READ|PROT_WRITE|PROT_EXEC)
+PROT_RWX = 7
+chain += rop.do_syscall(10, [shellcode_addr, 0x1000, PROT_RWX])  # mprotect
+
+# Stage 3: Jump to shellcode
+# (This would require finding a jmp or call gadget)
+# For simplicity, spawn a shell instead
+chain += rop.execve()
+
+print(f"Exploit chain length: {len(chain)} bytes")
+chain.print_payload_code()
+```
+
+## Best Practices
+
+1. **Check for syscall gadgets** before relying on `do_syscall()`
+2. **Use `execve()` for shells** instead of manually building the syscall
+3. **Set `needs_return=False`** for syscalls that don't return (execve, exit)
+4. **Save return values** immediately after syscalls that return important data
+5. **Use symbolic constants** for syscall numbers instead of magic numbers
+6. **Test syscall availability** - not all binaries have syscall instructions
+
+## Syscalls vs Library Functions
+
+| Aspect | Syscalls (`do_syscall`) | Library Functions (`func_call`) |
+|--------|------------------------|----------------------------------|
+| **Requirements** | Syscall/int 0x80 gadgets | Function address in PLT/GOT |
+| **Flexibility** | More control, direct kernel | Easier to use, automatic setup |
+| **Portability** | Kernel-dependent | Library-dependent |
+| **Chain size** | Often shorter | May be longer |
+| **Use case** | When library unavailable | When available and convenient |
+
+<Tip>
+Prefer `func_call()` for standard library functions when available. Use `do_syscall()` when:
+- The binary doesn't have the required library functions
+- You need precise control over syscall arguments
+- You're doing kernel-level exploitation
+- Library functions have security mitigations
+</Tip>
+
+## Next Steps
+
+- [Kernel ROP](/guides/kernel-rop) - Kernel-mode exploitation techniques
+- [Function Calls](/guides/function-calls) - Alternative to syscalls using library functions
+- [Badbytes](/guides/badbytes) - Handling restricted bytes in syscalls

@@ -1,0 +1,421 @@
+---
+title: Symbolic Execution
+description: How angrop uses angr's symbolic execution to analyze gadgets
+---
+
+## Overview
+
+angrop is built on top of angr's symbolic execution engine. Instead of executing instructions with concrete values, symbolic execution treats program inputs as symbolic variables and tracks all possible states through constraints.
+
+This allows angrop to:
+1. **Analyze gadget effects** - Understand what a gadget does to registers and memory
+2. **Find gadget capabilities** - Determine which registers can be controlled
+3. **Generate chains** - Solve constraints to build working ROP payloads
+4. **Verify correctness** - Ensure generated chains achieve their goals
+
+## Symbolic Execution in angr
+
+From the README:
+> "angrop uses symbolic execution to understand the effects of gadgets and uses constraint solving and graph search for generating chains."
+
+### Key Concepts
+
+**Symbolic State**: Represents program state where values can be symbolic (unknown) rather than concrete.
+
+**Constraints**: Logical conditions that must be satisfied (e.g., `rax + rbx == 0x1234`).
+
+**Constraint Solver**: Uses SMT solvers (Z3) to find values satisfying all constraints.
+
+**Unconstrained State**: A state where the instruction pointer is symbolic, indicating a controlled jump.
+
+## Analyzing Gadget Effects
+
+### Creating Symbolic States
+
+From `builder.py:47-55`:
+```python
+def make_sim_state(self, pc, stack_gsize):
+    # Create state with symbolized general-purpose registers
+    state = rop_utils.make_symbolic_state(
+        self.project, 
+        self.arch.reg_list,  # All GP registers
+        stack_gsize          # Symbolic stack slots
+    )
+    state.stack_pop()  # Emulate 'pop pc'
+    state.regs.ip = pc
+    return state
+```
+
+This creates a state where:
+- All GP registers are symbolic: `rax = sreg_rax_0`, `rbx = sreg_rbx_0`, etc.
+- Stack slots are symbolic: `[rsp+0] = symbolic_stack_0`, `[rsp+8] = symbolic_stack_1`, etc.
+- We can track how the gadget transforms these symbols
+
+### Stepping Through Gadgets
+
+From `builder.py:419-437`:
+```python
+# Step through each basic block in the gadget
+for addr in gadget.bbl_addrs[1:]:
+    succ = state.step()
+    # Find successor state matching the next block
+    succ_states = [
+        s for s in succ.successors 
+        if s.solver.is_true(s.ip == addr)
+    ]
+    state = succ_states[0]
+
+# Step to unconstrained successor (the return)
+succ = state.step()
+state = succ.unconstrained_successors[0]
+```
+
+**What this does**:
+1. Execute each instruction symbolically
+2. Track all possible execution paths
+3. Apply constraints from branches
+4. Reach the final state where `pc` is symbolic (return)
+
+### Extracting Effects
+
+After stepping through a gadget, angrop analyzes the final state:
+
+**Register effects**:
+```python
+# Check if register was modified
+if final_state.regs.rax != initial_state.regs.rax:
+    gadget.changed_regs.add('rax')
+
+# Check if register was popped from stack  
+if final_state.regs.rax.symbolic:
+    if 'symbolic_stack_0' in str(final_state.regs.rax):
+        gadget.popped_regs.add('rax')
+```
+
+**Memory effects**:
+```python
+# Analyze memory actions from execution history
+for action in state.history.actions:
+    if action.type == 'mem' and action.action == 'write':
+        mem_access = RopMemAccess()
+        mem_access.addr = action.addr.ast
+        mem_access.data = action.data.ast
+        # Extract dependencies from symbolic ASTs
+        mem_access.addr_dependencies = get_ast_dependency(addr)
+        mem_access.data_dependencies = get_ast_dependency(data)
+        gadget.mem_writes.append(mem_access)
+```
+
+## Constraint Solving for Chain Generation
+
+### The Core Algorithm
+
+From `builder.py:362-420`, the chain building process:
+
+```python
+def _build_reg_setting_chain(self, gadgets, register_dict):
+    # 1. Create symbolic state with stack and registers symbolic
+    test_symbolic_state = rop_utils.make_symbolic_state(
+        self.project, self.arch.reg_list, total_sc//arch_bytes+1
+    )
+    test_symbolic_state.ip = test_symbolic_state.stack_pop()
+    
+    # 2. Map stack variables to gadgets/values
+    stack_var_to_value = {}
+    
+    # 3. Step through each gadget
+    state = test_symbolic_state.copy()
+    for gadget in gadgets:
+        # Constrain IP to gadget address
+        state.solver.add(state.ip == gadget.addr)
+        state.ip = gadget.addr
+        
+        # Step through the gadget
+        for addr in gadget.bbl_addrs[1:]:
+            state = state.step().successors[0]
+        state = state.step().unconstrained_successors[0]
+    
+    # 4. Constrain final register values
+    for reg, val in register_dict.items():
+        state.solver.add(state.regs[reg] == val)
+    
+    # 5. Solve for stack values
+    for offset in range(0, total_sc, bytes_per_pop):
+        sym_word = test_symbolic_state.stack_read(offset)
+        # Solve what value this stack slot needs
+        concrete_val = state.solver.eval(sym_word)
+```
+
+### Example: Setting RAX to 0x1234
+
+Let's trace through finding a chain to set `rax = 0x1234`:
+
+**Gadget**: `pop rax; ret` at `0x401000`
+
+```python
+# Initial state
+state.regs.rax = symbolic('sreg_rax_0')  
+state.regs.rsp = symbolic('sreg_rsp_0')
+state.memory[rsp+0] = symbolic('symbolic_stack_0')  # Will be gadget address
+state.memory[rsp+8] = symbolic('symbolic_stack_1')  # Will be rax value
+
+# Step 1: Pop PC to get gadget address
+state.ip = state.stack_pop()  # ip = symbolic_stack_0
+state.solver.add(state.ip == 0x401000)  # Constrain to gadget
+
+# Step 2: Execute 'pop rax'
+state.step()
+state.regs.rax = symbolic_stack_1  # rax now contains stack slot 1
+state.regs.rsp += 8
+
+# Step 3: Execute 'ret'
+state.step()
+state.ip = symbolic_stack_2  # Unconstrained return
+
+# Step 4: Constrain final rax value  
+state.solver.add(state.regs.rax == 0x1234)
+# This constrains: symbolic_stack_1 == 0x1234
+
+# Step 5: Solve for stack values
+stack_0_value = state.solver.eval(symbolic_stack_0)  # = 0x401000
+stack_1_value = state.solver.eval(symbolic_stack_1)  # = 0x1234
+
+# Result: payload = p64(0x401000) + p64(0x1234)
+```
+
+## Advanced Constraint Solving
+
+### Rebalancing ASTs
+
+When gadgets transform values, we need to invert the operations:
+
+From `builder.py:245-359`:
+```python
+def _rebalance_ast(self, lhs, rhs, mode='stack'):
+    # Given: (symbolic_stack_0 + 0x1000) == user_value  
+    # Solve: symbolic_stack_0 == (user_value - 0x1000)
+    
+    while lhs.depth != 1:  # lhs is not just a symbolic variable
+        match lhs.op:
+            case "__add__":
+                # (stack + const) == value
+                # => stack == (value - const)
+                other = find_concrete_arg(lhs)
+                rhs -= other
+                lhs = find_symbolic_arg(lhs)
+                
+            case "__sub__":
+                # (stack - const) == value  
+                # => stack == (value + const)
+                other = find_concrete_arg(lhs)
+                rhs += other
+                lhs = find_symbolic_arg(lhs)
+                
+            case "ZeroExt":
+                # ZeroExt(N, stack) == value
+                # Check leading bits are zero, extract lower bits
+                rhs = Extract(rhs.length-lhs.args[0]-1, 0, rhs)
+                lhs = lhs.args[1]
+                
+            # ... handles xor, and, or, shifts, etc.
+    
+    return lhs, rhs  # lhs is now symbolic_stack_X, rhs is adjusted value
+```
+
+**Example**: Gadget `pop rax; add rax, 0x10; ret`
+```python
+# After symbolic execution:
+state.regs.rax = symbolic_stack_1 + 0x10
+
+# User wants rax = 0x1234
+state.solver.add((symbolic_stack_1 + 0x10) == 0x1234)
+
+# Rebalance:
+lhs = symbolic_stack_1 + 0x10
+rhs = 0x1234
+# Process __add__:
+rhs = 0x1234 - 0x10 = 0x1224
+lhs = symbolic_stack_1
+
+# Solution: stack slot 1 must be 0x1224
+```
+
+### Handling Symbolic Memory Accesses
+
+From `builder.py:472-492`:
+```python
+# Constrain memory access addresses
+for action in state.history.actions:
+    if action.type == 'mem' and action.addr.symbolic:
+        # Memory address depends on symbolic value
+        # Need to constrain it to a writable location
+        
+        if constrained_addrs is not None:
+            ptr_bv = constrained_addrs[0]
+        else:
+            # Find a writable address that doesn't contain badbytes
+            ptr_bv = BVV(self._get_ptr_to_writable(action.size//8))
+        
+        # Rebalance to find what stack value produces this address
+        lhs, rhs = self._rebalance_ast(action.addr.ast, ptr_bv)
+        # lhs is now symbolic_stack_X
+        # rhs is the value that makes the address work
+        
+        # Store the mapping
+        map_stack_var(lhs, RopValue(rhs))
+```
+
+**Example**: Gadget `mov [rax+0x10], rbx; ret`
+```python
+# After execution:
+action.addr = state.regs.rax + 0x10  # = symbolic_stack_1 + 0x10
+
+# We need this to point to a writable address, say 0x601000
+ptr_bv = 0x601000
+
+# Rebalance:
+# (symbolic_stack_1 + 0x10) == 0x601000
+# symbolic_stack_1 == 0x600ff0
+
+# Solution: stack slot 1 must be 0x600ff0
+```
+
+## Verification
+
+After generating a chain, angrop verifies it works:
+
+From `reg_setter.py:161-200`:
+```python
+def verify(self, chain, preserve_regs, registers):
+    # Execute the chain symbolically
+    state = chain.exec()
+    
+    # Check all actions respect constraints
+    for act in state.history.actions:
+        if act.type == 'mem':
+            # Ensure no out-of-bounds memory access
+            if act.addr.ast.variables and \
+               any(not x.startswith('sym_addr') for x in act.addr.ast.variables):
+                return False
+        
+        if act.type == 'reg' and act.action == 'write':
+            # Ensure preserved registers weren't modified
+            reg_name = self.project.arch.translate_register_name(act.offset)
+            if reg_name in preserve_regs:
+                return False
+    
+    # Verify final register values
+    for reg, val in registers.items():
+        bv = getattr(state.regs, reg)
+        if state.solver.eval(bv != val.data):
+            return False  # Register wasn't set correctly
+    
+    # Verify next PC is symbolic (in our control)
+    if len(state.regs.pc.variables) != 1:
+        return False
+    pc_var = set(state.regs.pc.variables).pop()
+    return pc_var.startswith("next_pc")
+```
+
+This ensures:
+1. No unintended register modifications
+2. No out-of-bounds memory accesses  
+3. All target registers reach desired values
+4. Control flow remains in our hands
+
+## Symbolic State Management
+
+### State Copying and Constraints
+
+angr's symbolic states are copied when exploring multiple paths:
+
+```python
+# Branch creates two states
+if_true_state = state.copy()
+if_true_state.add_constraints(condition == True)
+
+if_false_state = state.copy()  
+if_false_state.add_constraints(condition == False)
+```
+
+angrop uses this for:
+- **Exploring conditional gadgets**: Try both branches
+- **Preserving states**: Keep original state while constraining copies
+- **Parallel chain attempts**: Try multiple gadget combinations
+
+### Constraint Satisfiability
+
+Before building chains, check if constraints are satisfiable:
+
+```python
+if not state.satisfiable():
+    raise RopException("Constraints are unsatisfiable")
+
+# Check if specific constraint is possible
+if state.solver.satisfiable([new_constraint]):
+    state.add_constraints(new_constraint)
+```
+
+This avoids wasting time on impossible chains.
+
+## Performance Considerations
+
+### Constraint Complexity
+
+From `builder.py:361`:
+```python
+@rop_utils.timeout(3)
+def _build_reg_setting_chain(self, gadgets, register_dict):
+    # Timeout after 3 seconds to avoid hanging on complex constraints
+```
+
+Symbolic execution can be slow when:
+- Many gadgets in a chain (exponential state explosion)
+- Complex arithmetic operations (hard for SMT solver)
+- Many symbolic memory accesses
+
+angrop mitigates this by:
+1. Filtering gadgets early
+2. Limiting chain length
+3. Using timeouts
+4. Caching results
+
+### Caching Symbolic Results
+
+From `mem_writer.py:494-515`:
+```python
+class MemWriteChain:
+    def __init__(self, builder, gadget, preserve_regs):
+        # Symbolically execute gadget once
+        self.addr_bv = BVS("addr", addr_size)
+        self.data_bv = BVS("data", data_size)  
+        self.chain = self._build_chain()  # Cached symbolic chain
+    
+    def concretize(self, addr_val, data):
+        # Reuse symbolic chain, just substitute concrete values
+        chain = self.chain.copy()
+        for val in chain._values:
+            if 'addr_' in val.variables:
+                val.substitute(self.addr_bv, addr_val)
+            if 'data_' in val.variables:
+                val.substitute(self.data_bv, data)
+        return chain
+```
+
+This allows writing to multiple addresses efficiently without re-solving constraints.
+
+## Integration with Chain Building
+
+Symbolic execution enables the entire chain building pipeline:
+
+1. **Gadget Discovery**: Symbolically execute candidate gadgets to analyze effects
+2. **Capability Analysis**: Determine which registers/memory each gadget can control  
+3. **Graph Construction**: Build state-transition graph based on symbolic effects
+4. **Path Finding**: Search graph for paths that achieve goals
+5. **Constraint Solving**: Solve for concrete stack values that satisfy all constraints
+6. **Verification**: Symbolically re-execute to confirm correctness
+
+From the README:
+> "angrop uses symbolic execution to understand the effects of gadgets and uses constraint solving and graph search for generating chains."
+
+This combination of techniques allows angrop to automatically build complex ROP chains that would take humans hours to construct manually.

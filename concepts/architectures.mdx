@@ -1,0 +1,423 @@
+---
+title: Architecture Support
+description: Supported architectures and angrop's architecture-agnostic design
+---
+
+## Supported Architectures
+
+From the README, angrop supports multiple processor architectures:
+
+- **x86** (32-bit Intel/AMD)
+- **x64** (AMD64, 64-bit Intel/AMD)  
+- **MIPS** (32-bit and 64-bit)
+- **ARM** (32-bit, including Thumb mode)
+- **AArch64** (ARM 64-bit)
+- **RISC-V** (64-bit)
+
+## Architecture-Agnostic Design
+
+From the README:
+> "Its design is architecture-agnostic so it supports multiple architectures."
+
+angrop achieves architecture independence through abstraction layers:
+
+### The ROPArch Class
+
+From `arch.py:5-39`, the base architecture class:
+
+```python
+class ROPArch:
+    def __init__(self, project, kernel_mode=False):
+        self.project = project
+        self.kernel_mode = kernel_mode
+        
+        # Architecture-specific configuration
+        self.alignment = project.arch.instruction_alignment
+        self.reg_list = self._get_reg_list()
+        self.max_block_size = None
+        self.fast_mode_max_block_size = None
+        
+        # Key architecture registers
+        a = project.arch
+        self.stack_pointer = a.register_names[a.sp_offset]
+        self.base_pointer = a.register_names[a.bp_offset]
+        
+        # Architecture-specific instruction patterns
+        self.syscall_insts = None
+        self.ret_insts = None
+        
+        # Syscall numbers
+        self.execve_num = None
+        self.sigreturn_num = None
+```
+
+This provides a uniform interface across architectures while allowing specialization.
+
+### Register Management
+
+From `arch.py:24-39`:
+```python
+def _get_reg_list(self):
+    """Get general-purpose registers + bp"""
+    arch = self.project.arch
+    sp_reg = arch.register_names[arch.sp_offset]
+    ip_reg = arch.register_names[arch.ip_offset]
+    bp_reg = arch.register_names[arch.bp_offset]
+    
+    # Get default symbolic registers
+    default_regs = arch.default_symbolic_registers
+    
+    # Exclude sp and ip, include bp
+    reg_list = [r for r in default_regs 
+                if r not in (sp_reg, ip_reg, bp_reg)]
+    reg_list.append(bp_reg)
+    return reg_list
+```
+
+This automatically adapts to different register naming conventions:
+- x86: `eax, ebx, ecx, edx, esi, edi, ebp`
+- x64: `rax, rbx, rcx, rdx, rsi, rdi, r8-r15, rbp`
+- ARM: `r0-r12, lr`
+- AArch64: `x0-x30`
+- MIPS: `$v0-$v1, $a0-$a3, $t0-$t9, $s0-$s8`
+
+## x86 (32-bit)
+
+From `arch.py:44-86`:
+
+```python
+class X86(ROPArch):
+    def __init__(self, project, kernel_mode=False):
+        super().__init__(project, kernel_mode=kernel_mode)
+        self.max_block_size = 20
+        self.fast_mode_max_block_size = 12
+        
+        # System call instruction
+        self.syscall_insts = {b"\xcd\x80"}  # int 0x80
+        
+        # Return instructions  
+        self.ret_insts = {b"\xc2", b"\xc3", b"\xca", b"\xcb"}
+        
+        # Segment registers
+        self.segment_regs = {"cs", "ds", "es", "fs", "gs", "ss"}
+        
+        # Syscall numbers
+        self.execve_num = 0xb        # sys_execve = 11
+        self.sigreturn_num = 0x77    # sys_sigreturn = 119
+```
+
+**Key characteristics**:
+- Uses `int 0x80` for system calls
+- Multiple return instruction variants (`ret`, `ret imm16`, `retf`, etc.)
+- Segment registers not used in ROP (filtered out)
+- Smaller maximum gadget size (20 instructions)
+
+**Filtered instructions** (arch.py:69-77):
+```python
+def block_make_sense(self, block):
+    capstr = str(block.capstone).lower()
+    # Exclude problematic instructions:
+    if any(x in capstr for x in ('cli', 'rex', 'repz ret', 
+                                  'retf', 'hlt', 'wait', 
+                                  'loop', 'lock')):
+        return False
+    if not kernel_mode and ("fs:" in capstr or "gs:" in capstr):
+        return False  # Segment register operations
+    return True
+```
+
+## x64 (AMD64)
+
+From `arch.py:87-96`:
+
+```python
+class AMD64(X86):
+    def __init__(self, project, kernel_mode=False):
+        super().__init__(project, kernel_mode=kernel_mode)
+        
+        # Different syscall instruction
+        self.syscall_insts = {b"\x0f\x05"}  # syscall
+        
+        # Different segment register names
+        self.segment_regs = {"cs_seg", "ds_seg", "es_seg", 
+                            "fs_seg", "gs_seg", "ss_seg"}
+        
+        # Different syscall numbers (64-bit ABI)
+        self.execve_num = 0x3b      # sys_execve = 59
+        self.sigreturn_num = 0xf    # sys_rt_sigreturn = 15
+```
+
+**Key differences from x86**:
+- Uses `syscall` instruction instead of `int 0x80`
+- Different syscall numbers (Linux x64 ABI)
+- 64-bit registers (`rax` vs `eax`)
+- Different calling convention (registers vs stack)
+
+## ARM (32-bit)
+
+From `arch.py:100-128`:
+
+```python
+class ARM(ROPArch):
+    def __init__(self, project, kernel_mode=False):
+        super().__init__(project, kernel_mode=kernel_mode)
+        
+        # Thumb mode support
+        self.is_thumb = False
+        
+        # Instruction alignment
+        self.alignment = self.project.arch.bytes  # 4 bytes
+        self.max_block_size = self.alignment * 8   # 32 bytes
+        self.fast_mode_max_block_size = self.alignment * 6  # 24 bytes
+        
+        # Syscall number
+        self.execve_num = 0xb
+    
+    def set_thumb(self):
+        """Switch to Thumb mode (16-bit instructions)"""
+        self.is_thumb = True
+        self.alignment = 2           # 2-byte alignment
+        self.max_block_size = 16
+        self.fast_mode_max_block_size = 12
+    
+    def set_arm(self):
+        """Switch to ARM mode (32-bit instructions)"""
+        self.is_thumb = False
+        self.alignment = 4
+        self.max_block_size = 32  
+        self.fast_mode_max_block_size = 24
+```
+
+**ARM-specific features**:
+- Return via `pop {pc}` or `bx lr`
+- Conditional execution on every instruction
+- Thumb mode for 16-bit instruction encoding
+
+**Conditional instruction filtering** (arch.py:122-128):
+```python
+arm_conditional_postfix = ['eq', 'ne', 'cs', 'hs', 'cc', 'lo', 
+                           'mi', 'pl', 'vs', 'vc', 'hi', 'ls', 
+                           'ge', 'lt', 'gt', 'le', 'al']
+
+def block_make_sense(self, block):
+    for insn in block.capstone.insns:
+        # Disable conditional jumps for now
+        if insn.insn.mnemonic[-2:] in arm_conditional_postfix:
+            return False
+    return True
+```
+
+### Thumb Mode
+
+From `rop.py:36-37`:
+```python
+def __init__(self, ..., is_thumb=False, ...):
+    """  
+    :param is_thumb: execute ROP chain in thumb mode. Only makes 
+                     difference on ARM architecture. angrop does 
+                     not switch mode within a rop chain
+    """
+```
+
+Thumb mode characteristics:
+- 16-bit instruction encoding (vs 32-bit ARM)
+- 2-byte instruction alignment
+- Smaller code size
+- Most ARM instructions available in Thumb
+- Cannot mix ARM and Thumb in same ROP chain
+
+**Setting Thumb mode**:
+```python
+import angr
+import angrop
+
+p = angr.Project("/path/to/arm_binary")
+rop = p.analyses.ROP(is_thumb=True)  # Enable Thumb mode
+rop.find_gadgets()
+```
+
+When `is_thumb=True`, gadgets are searched at 2-byte aligned addresses with Thumb decoding.
+
+## AArch64 (ARM 64-bit)
+
+From `arch.py:130-143`:
+
+```python
+class AARCH64(ROPArch):
+    def __init__(self, project, kernel_mode=False):
+        super().__init__(project, kernel_mode=kernel_mode)
+        
+        # Fixed-size 4-byte instructions
+        self.ret_insts = {b'\xc0\x03_\xd6'}  # ret instruction
+        self.max_block_size = self.alignment * 10
+        self.fast_mode_max_block_size = self.alignment * 6
+        
+        # Syscall number
+        self.execve_num = 0xdd
+    
+    def block_make_sense(self, block):
+        for x in block.capstone.insns:
+            # Filter out PAC (Pointer Authentication)
+            if x.mnemonic == 'autiasp':
+                return False
+        return True
+```
+
+**AArch64 features**:
+- 64-bit registers: `x0-x30` (vs ARM's `r0-r12`)
+- Fixed 4-byte instruction size (no Thumb)
+- Return via `ret` instruction
+- PAC (Pointer Authentication Codes) filtered - incompatible with ROP
+
+## MIPS
+
+From `arch.py:145-152`:
+
+```python
+class MIPS(ROPArch):
+    def __init__(self, project, kernel_mode=False):
+        super().__init__(project, kernel_mode=kernel_mode)
+        
+        # MIPS always 4-byte aligned
+        self.alignment = self.project.arch.bytes
+        self.max_block_size = self.alignment * 8
+        self.fast_mode_max_block_size = self.alignment * 6
+        
+        # Syscall instruction and number
+        self.execve_num = 0xfab
+        self.syscall_insts = {b"\x0c\x00\x00\x00"}  # syscall
+```
+
+**MIPS characteristics**:
+- Delay slots after branches (branch executes, then next instruction, then jump)
+- Different syscall number encoding
+- Both big-endian and little-endian variants supported
+
+## RISC-V (64-bit)
+
+From `arch.py:154-160`:
+
+```python
+class RISCV64(ROPArch):
+    def __init__(self, project, kernel_mode=False):
+        super().__init__(project, kernel_mode=kernel_mode)
+        
+        # Return instruction
+        self.ret_insts = {b"\x82\x80"}  # ret (jalr x0, x1, 0)
+        self.max_block_size = self.alignment * 10
+        self.fast_mode_max_block_size = self.alignment * 6
+        
+        # Syscall number  
+        self.execve_num = 0xdd
+```
+
+**RISC-V features**:
+- Clean RISC architecture
+- Compressed instruction set (16-bit and 32-bit)
+- Return via `ret` (pseudo-instruction for `jalr x0, x1, 0`)
+
+## Architecture Detection
+
+From `arch.py:162-178`:
+
+```python
+def get_arch(project, kernel_mode=False):
+    """Automatically detect and return correct architecture class"""
+    name = project.arch.name
+    mode = kernel_mode
+    
+    if name == 'X86':
+        return X86(project, kernel_mode=mode)
+    elif name == 'AMD64':
+        return AMD64(project, kernel_mode=mode)
+    elif name.startswith('ARM'):
+        return ARM(project, kernel_mode=mode)
+    elif name == 'AARCH64':
+        return AARCH64(project, kernel_mode=mode)
+    elif name == 'RISCV64':
+        return RISCV64(project, kernel_mode=mode)
+    elif name.startswith('MIPS'):
+        return MIPS(project, kernel_mode=mode)
+    else:
+        raise ValueError(f"Unknown arch: {name}")
+```
+
+This is called automatically when creating an ROP analysis:
+```python
+p = angr.Project("/bin/some_binary")
+rop = p.analyses.ROP()  # Architecture auto-detected from binary
+```
+
+## Kernel Mode
+
+All architectures support kernel mode for finding gadgets in kernel code:
+
+```python
+rop = p.analyses.ROP(kernel_mode=True)
+```
+
+**Kernel mode differences**:
+- Uses kernel syscall numbers
+- Allows segment register operations (x86/x64)
+- Searches in `.text` section of kernel images
+- Different constraints on memory accesses
+
+From arch.py:
+```python
+if self.arch.kernel_mode:
+    segs = [x for x in project.loader.main_object.sections 
+            if x.name in ('.data', '.bss')]
+else:
+    segs = [s for s in project.loader.main_object.segments 
+            if s.is_writable]
+```
+
+## Adding New Architectures
+
+From the README:
+> "It should be relatively easy to support other architectures that are supported by angr. If you'd like to use angrop on other architectures, please create an issue and we will look into it :)"
+
+To add a new architecture:
+
+1. Create a new class inheriting from `ROPArch`:
+```python
+class NewArch(ROPArch):
+    def __init__(self, project, kernel_mode=False):
+        super().__init__(project, kernel_mode=kernel_mode)
+        self.syscall_insts = {b"\x..."}  # Syscall bytes
+        self.ret_insts = {b"\x..."}      # Return bytes  
+        self.execve_num = 0x...          # Execve syscall number
+        # Set size limits
+        self.max_block_size = ...
+        self.fast_mode_max_block_size = ...
+```
+
+2. Implement `block_make_sense()` to filter invalid instruction sequences
+
+3. Add to `get_arch()` function:
+```python
+elif name == 'NEWARCH':
+    return NewArch(project, kernel_mode=mode)
+```
+
+The rest of angrop (gadget finding, chain building, symbolic execution) works without modification due to the architecture-agnostic design.
+
+## Cross-Architecture Exploitation
+
+The same angrop API works across all architectures:
+
+```python
+# Works on x86, x64, ARM, MIPS, etc.
+chain = rop.set_regs(register=0x1234)
+chain += rop.write_to_mem(addr, data)
+chain += rop.execve()
+```
+
+angrop handles:
+- Register name differences
+- Calling convention differences  
+- Instruction encoding differences
+- Endianness differences
+- Alignment requirements
+
+This makes it easy to develop exploits for different architectures without learning architecture-specific ROP techniques.

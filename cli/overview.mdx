@@ -1,0 +1,38 @@
+---
+title: CLI Overview
+description: Command-line interface for angrop ROP chain building
+---
+
+## Introduction
+
+angrop comes with a command-line tool called `angrop-cli` for easy day-to-day ROP gadget finding and chain building.
+
+The CLI provides basic gadget finding and chaining capabilities, including:
+- Finding `system`/`execve` chains
+- Invoking specific functions with controlled arguments
+- Dumping all gadgets from a binary
+
+For more advanced features, use the [Python API](/api/rop).
+
+## Basic Usage
+
+The CLI follows this pattern:
+
+```bash
+angrop-cli <command> [<options>] <path>
+```
+
+## Available Commands
+
+angrop-cli provides two main commands:
+
+- **[dump](/cli/dump-command)** - Find and list all ROP gadgets in a binary
+- **[chain](/cli/chain-command)** - Build ROP chains for specific targets (execve, system, function calls)
+
+## Installation
+
+The `angrop-cli` command is automatically installed as a console script when you install angrop:
+
+```bash
+pip install angrop
+```

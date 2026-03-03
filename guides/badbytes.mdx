@@ -1,0 +1,503 @@
+---
+title: Badbytes
+description: Handle restricted bytes in ROP chains using angrop's badbyte avoidance techniques
+---
+
+Many exploitation scenarios involve restricted bytes (badbytes) that cannot appear in your payload. Angrop provides sophisticated methods to automatically avoid badbytes in generated ROP chains.
+
+## What are Badbytes?
+
+Badbytes are byte values that cannot appear in your exploit payload due to input filtering or processing. Common examples:
+
+- **Null bytes** (`0x00`) - Terminated by string functions like `strcpy`, `scanf`
+- **Newlines** (`0x0a`, `0x0d`) - Terminated by line-oriented input functions  
+- **Whitespace** (`0x09`, `0x20`) - Filtered by input parsing
+- **Control characters** - Stripped or modified by terminal handlers
+- **Application-specific** - Custom filters in the target program
+
+<Note>
+Badbytes can appear in:
+1. **Gadget addresses** - The address of the gadget itself
+2. **Data values** - Constants, strings, or pointers in the chain
+3. **Intermediate values** - Values created during chain execution
+
+Angrop handles all three cases automatically.
+</Note>
+
+## Configuring Badbytes: `set_badbytes()`
+
+Use the `set_badbytes()` method to specify restricted bytes before finding gadgets.
+
+### Method Signature
+
+```python
+rop.set_badbytes(badbytes)
+```
+
+**Parameters:**
+- `badbytes`: List of 8-bit integers (0-255) representing restricted bytes
+
+### Basic Examples
+
+<Steps>
+  <Step title="Set common badbytes">
+    ```python
+    import angr
+    import angrop
+
+    proj = angr.Project("/bin/bash")
+    rop = proj.analyses.ROP()
+
+    # Avoid null bytes and newlines
+    rop.set_badbytes([0x00, 0x0a])
+
+    # Now find gadgets
+    rop.find_gadgets()
+    ```
+  </Step>
+
+  <Step title="Set multiple badbytes">
+    ```python
+    # Avoid null, newline, carriage return, and space
+    rop.set_badbytes([0x00, 0x09, 0x0a, 0x0d, 0x20])
+    rop.find_gadgets()
+    ```
+  </Step>
+
+  <Step title="Use character values">
+    ```python
+    # You can also use character strings
+    rop.set_badbytes([ord('\x00'), ord('\n'), ord(' ')])
+    
+    # Or mix integers and characters
+    rop.set_badbytes([0x00, ord('\n'), ord(' ')])
+    ```
+  </Step>
+</Steps>
+
+<Warning>
+Always call `set_badbytes()` **before** `find_gadgets()`. Setting badbytes after finding gadgets will filter out incompatible gadgets but may result in fewer available gadgets than if you set them first.
+</Warning>
+
+## Checking Configured Badbytes: `get_badbytes()`
+
+Retrieve the current badbytes configuration:
+
+```python
+# Set badbytes
+rop.set_badbytes([0x00, 0x0a])
+
+# Later, check what's configured
+badbytes = rop.get_badbytes()
+print(f"Configured badbytes: {[hex(b) for b in badbytes]}")
+# Output: Configured badbytes: ['0x0', '0xa']
+```
+
+## How Badbyte Avoidance Works
+
+Angrop uses multiple strategies to avoid badbytes:
+
+### 1. Gadget Address Filtering
+
+From the source code (`rop.py:72-97`), when gadgets are found:
+
+```python
+# Pseudocode from angrop internals
+for gadget in all_gadgets:
+    if gadget_address_contains_badbytes(gadget.addr):
+        # Try to find equivalent gadget without badbytes
+        equivalent = find_duplicate_gadget_safe_address(gadget)
+        if equivalent:
+            use(equivalent)
+        else:
+            skip(gadget)
+```
+
+Angrop maintains a database of duplicate gadgets (same instructions, different addresses) and substitutes safe addresses when available.
+
+### 2. Value Construction via Arithmetic
+
+When you need to set a register to a value containing badbytes, angrop constructs it using arithmetic operations:
+
+```python
+import angr
+import angrop
+
+proj = angr.Project("/bin/bash")
+rop = proj.analyses.ROP()
+rop.set_badbytes([0x00, 0x0a])
+rop.find_gadgets()
+
+# Set register to value containing badbytes
+chain = rop.set_regs(rax=0x0a0a0a0a)  # Contains 0x0a badbytes
+
+# Angrop might generate:
+# pop rax; ret
+#   0x0b0b0b0b   <- Safe value
+# dec rax; ret    <- Subtract 0x01010101 using multiple dec
+# Result: 0x0a0a0a0a without any 0x0a bytes in the chain!
+```
+
+From the source code (`reg_setter.py:699-725`), angrop tries:
+
+1. **Concrete value gadgets** - Gadgets that set registers to specific values
+2. **Arithmetic chains** - Using add/sub/xor/or/and to construct values
+3. **Register moves** - Moving from registers that can be safely set
+
+### 3. Memory Write Transformations
+
+When writing data containing badbytes to memory, angrop uses sophisticated multi-step transformations:
+
+```python
+import angr
+import angrop
+
+proj = angr.Project("/bin/bash")
+rop = proj.analyses.ROP()
+rop.set_badbytes([0x00, 0x0a])
+rop.find_gadgets()
+
+# Write data containing badbytes
+data = b"\x00\x0a\x0d\xff"  # Contains 0x00 and 0x0a
+chain = rop.write_to_mem(0x61b100, data)
+
+# Angrop automatically:
+# 1. Writes safe initial bytes (e.g., 0x01 instead of 0x00)
+# 2. Uses mem_xor/mem_add/mem_and/mem_or to transform to target
+# 3. Result: correct data in memory, no badbytes in chain
+```
+
+From the source code (`mem_writer.py:213-250`), angrop tries operations in order:
+
+<Steps>
+  <Step title="Try XOR transformation">
+    ```python
+    # To write 0x0a (badbyte):
+    # Write 0x00 (if safe), then XOR with 0x0a via safe value
+    # Or write 0x0b (safe), then XOR with 0x01
+    ```
+  </Step>
+
+  <Step title="Try OR transformation">
+    ```python
+    # Write 0x00 (if safe), then OR with target value
+    # Useful when target has many bits set
+    ```
+  </Step>
+
+  <Step title="Try AND transformation">
+    ```python
+    # Write 0xFF (if safe), then AND with target
+    # Useful for clearing specific bits
+    ```
+  </Step>
+
+  <Step title="Try ADD transformation">
+    ```python
+    # Write safe base value, then ADD difference
+    # Example: Write 0x09, then ADD 1 to get 0x0a
+    ```
+  </Step>
+</Steps>
+
+<Tip>
+The `fill_byte` parameter in `write_to_mem()` should never be a badbyte. Angrop will raise an error if you try to use a badbyte as the fill byte.
+</Tip>
+
+## Real-World Example: Null-Free Exploit
+
+```python
+import angr
+import angrop
+
+proj = angr.Project("/bin/bash")
+rop = proj.analyses.ROP()
+
+# Configure for strcpy vulnerability (null-terminated)
+rop.set_badbytes([0x00])
+rop.find_gadgets()
+
+# Build exploit chain
+chain = rop.write_to_mem(0x61b100, b"/bin/sh\x00")  # Contains null at end
+chain += rop.set_regs(rdi=0x61b100)  # Address doesn't contain null
+chain += rop.func_call("system", [], preserve_regs={'rdi'})
+
+# Verify no badbytes in chain
+payload = chain.payload_str()
+if 0x00 in payload:
+    print("ERROR: Null byte found!")
+else:
+    print(f"Success! Null-free chain: {len(payload)} bytes")
+
+chain.print_payload_code()
+```
+
+## Common Badbyte Scenarios
+
+### Scenario 1: strcpy Vulnerability
+
+```python
+# Null bytes terminate the copy
+rop.set_badbytes([0x00])
+```
+
+### Scenario 2: Line-Based Input
+
+```python
+# fgets or scanf %s terminate on newlines
+rop.set_badbytes([0x00, 0x0a, 0x0d])
+```
+
+### Scenario 3: URL/HTTP Input
+
+```python
+# URL encoding issues with special characters
+rop.set_badbytes([
+    0x00,        # Null
+    0x0a, 0x0d,  # Newlines
+    0x20,        # Space
+    0x22,        # Double quote
+    0x25,        # Percent
+    0x26,        # Ampersand  
+    0x3c, 0x3e,  # < >
+])
+```
+
+### Scenario 4: Alphanumeric Shellcode
+
+```python
+# Only allow alphanumeric characters
+allowed = set(range(ord('0'), ord('9')+1)) | \
+          set(range(ord('A'), ord('Z')+1)) | \
+          set(range(ord('a'), ord('z')+1))
+badbytes = [b for b in range(256) if b not in allowed]
+rop.set_badbytes(badbytes)
+```
+
+<Warning>
+Extremely restrictive badbyte lists (like alphanumeric-only) may make it impossible to find working gadgets. If `find_gadgets()` finds very few or no gadgets, you may need to reconsider your approach.
+</Warning>
+
+## Troubleshooting Badbyte Issues
+
+### Issue 1: "Couldn't set registers" Error
+
+**Cause:** Too many badbytes make it impossible to construct required values.
+
+**Solutions:**
+```python
+try:
+    chain = rop.set_regs(rax=0x0a0a0a0a)
+except angrop.errors.RopException:
+    # Try alternative approaches:
+    # 1. Use different value if possible
+    # 2. Use register moves from settable registers
+    # 3. Reduce badbyte restrictions if possible
+    chain = rop.move_regs(rax='rbx') + rop.set_regs(rbx=safe_value)
+```
+
+### Issue 2: "Fail to write data to memory" Error
+
+**Cause:** Can't construct memory write chain without badbytes.
+
+**Solutions:**
+```python
+# Try with a different fill_byte
+chain = rop.write_to_mem(addr, data, fill_byte=b"\xff")  # Instead of default
+
+# Or split writes into smaller chunks
+for i in range(0, len(data), 4):
+    chunk = data[i:i+4]
+    chain += rop.write_to_mem(addr + i, chunk)
+```
+
+### Issue 3: Very Few Gadgets Found
+
+**Cause:** Badbytes eliminate too many gadget addresses.
+
+**Solutions:**
+<Steps>
+  <Step title="Check badbyte configuration">
+    ```python
+    print(f"Badbytes: {[hex(b) for b in rop.get_badbytes()]}")
+    # Verify you didn't accidentally set too many
+    ```
+  </Step>
+
+  <Step title="Use fast_mode=False">
+    ```python
+    # Find more gadgets
+    rop = proj.analyses.ROP(fast_mode=False)
+    rop.set_badbytes([0x00, 0x0a])
+    rop.find_gadgets()
+    ```
+  </Step>
+
+  <Step title="Check gadget availability">
+    ```python
+    print(f"Found {len(rop.rop_gadgets)} usable gadgets")
+    if len(rop.rop_gadgets) < 10:
+        print("WARNING: Very few gadgets available!")
+    ```
+  </Step>
+</Steps>
+
+### Issue 4: Addresses Contain Badbytes
+
+**Cause:** The binary loads at addresses containing badbytes.
+
+**Solutions:**
+```python
+# Check binary base address
+print(f"Binary base: {hex(proj.loader.main_object.min_addr)}")
+
+# For PIE binaries, you might need to leak addresses
+# For non-PIE, you might need different exploitation technique
+
+# Alternative: Use partial overwrites if possible
+# Or find a different binary/library to exploit
+```
+
+## Advanced Badbyte Techniques
+
+### Technique 1: Register Arithmetic Chains
+
+When direct register setting fails, use arithmetic:
+
+```python
+# Can't set rax to 0x0a0a0a0a directly (contains badbyte)
+# Instead, construct it via arithmetic:
+
+# Method 1: Addition
+chain = rop.set_regs(rax=0x09090909)  # Safe value
+chain += rop.set_regs(rbx=0x01010101, preserve_regs={'rax'})  # Safe value
+# Then use add rax, rbx gadget (if available)
+
+# Method 2: XOR
+chain = rop.set_regs(rax=0xffffffff)
+chain += rop.set_regs(rbx=0xf5f5f5f5, preserve_regs={'rax'})
+# Then use xor rax, rbx gadget
+# Result: 0xffffffff ^ 0xf5f5f5f5 = 0x0a0a0a0a
+```
+
+### Technique 2: Memory Staging
+
+Write data to memory in multiple stages:
+
+```python
+import angr
+import angrop
+
+proj = angr.Project("/bin/bash")
+rop = proj.analyses.ROP()
+rop.set_badbytes([0x00])
+rop.find_gadgets()
+
+# Stage 1: Write safe initial value
+chain = rop.write_to_mem(0x61b100, b"\x01\x01\x01\x01")
+
+# Stage 2: Modify to target value using mem_xor
+chain += rop.mem_xor(0x61b100, 0x01010101, size=4)
+# Result: 0x01010101 ^ 0x01010101 = 0x00000000 (contains nulls)
+```
+
+### Technique 3: Gadget Equivalence
+
+Angrop automatically finds equivalent gadgets at safe addresses:
+
+```python
+# Angrop maintains duplicate gadget database
+# If gadget at 0x401000 (contains badbyte) does:
+#   pop rax; ret
+# And gadget at 0x402000 (safe) does the same:
+#   pop rax; ret
+# Angrop automatically uses 0x402000
+```
+
+## Best Practices
+
+1. **Set badbytes early** - Always before `find_gadgets()`
+2. **Be conservative** - Only restrict truly necessary bytes
+3. **Test payloads** - Verify no badbytes in final chain
+4. **Cache gadgets** - Save and reuse gadgets for same binary+badbytes
+5. **Understand constraints** - Know why bytes are restricted
+6. **Have fallbacks** - Plan alternative exploitation if chains fail
+
+## Testing for Badbytes
+
+```python
+import angr
+import angrop
+
+proj = angr.Project("/bin/bash")
+rop = proj.analyses.ROP()
+rop.set_badbytes([0x00, 0x0a])
+rop.find_gadgets()
+
+# Build your chain
+chain = rop.execve()
+
+# Get raw bytes
+payload = chain.payload_str()
+
+# Check for badbytes
+badbytes = rop.get_badbytes()
+found_badbytes = [b for b in badbytes if b in payload]
+
+if found_badbytes:
+    print(f"ERROR: Found badbytes: {[hex(b) for b in found_badbytes]}")
+    print(f"At positions: {[payload.index(b) for b in found_badbytes]}")
+else:
+    print("Success! No badbytes in payload")
+    print(f"Payload length: {len(payload)} bytes")
+```
+
+## Performance Impact
+
+Badbyte restrictions affect performance:
+
+- **Gadget finding**: Slower as more gadgets are filtered
+- **Chain building**: May require longer chains to avoid badbytes
+- **Optimization**: More complex constraint solving
+
+<Tip>
+**Performance tips:**
+- Cache gadgets for reuse across exploits
+- Use `optimize=True` to discover alternative gadget chains
+- Start with minimal badbyte restrictions and add only as needed
+</Tip>
+
+## Badbyte Limitations
+
+### When Badbyte Avoidance Fails
+
+Some situations make badbyte-free chains impossible:
+
+1. **Binary base contains badbytes** - Non-PIE binary at bad address
+2. **Too many badbytes** - Overly restrictive filter (e.g., alphanumeric-only)
+3. **Required values contain badbytes** - Specific addresses or constants needed
+4. **Insufficient gadgets** - Not enough safe gadgets available
+
+### Alternative Approaches
+
+When angrop can't generate badbyte-free chains:
+
+```python
+# Approach 1: Encoding/Decoding
+# Write encoded payload, then decode in memory
+
+# Approach 2: Partial Overwrites  
+# Overwrite only parts of addresses/values
+
+# Approach 3: Different Primitive
+# Use different vulnerability (format string, etc.)
+
+# Approach 4: Heap Feng Shui
+# Arrange heap to place data at safe addresses
+```
+
+## Next Steps
+
+- [Memory Operations](/guides/memory-operations) - See how badbytes affect memory writes
+- [Register Operations](/guides/register-operations) - Understand arithmetic value construction
+- [Optimization](/guides/optimization) - Learn about gadget optimization with badbytes

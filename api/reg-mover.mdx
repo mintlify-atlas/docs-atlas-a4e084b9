@@ -1,0 +1,374 @@
+---
+title: RegMover
+description: Register move chain builder for copying values between registers
+---
+
+The `RegMover` class builds ROP chains that move data from one register to another. It uses graph-based path finding to chain register moves when direct moves aren't available.
+
+## Overview
+
+Accessed through the ROP instance as `rop.move_regs()`, RegMover automatically:
+- Finds direct move gadgets like `mov rax, rdx; ret`
+- Chains multiple moves when needed
+- Uses push/pop sequences as fallback
+- Optimizes move paths for efficiency
+
+## Class Definition
+
+```python
+class RegMover(Builder)
+```
+
+Located in `angrop/chain_builder/reg_mover.py`
+
+## Public Methods
+
+### run
+
+```python
+run(preserve_regs=None, **registers) -> RopChain
+```
+
+Builds a ROP chain that moves register values.
+
+<ParamField path="preserve_regs" type="set | None" default="None">
+  Set of register names that must not be modified.
+</ParamField>
+
+<ParamField path="**registers">
+  Keyword arguments mapping destination register to source register name (as string).
+  Example: `rax='rdx'` means move rdx to rax.
+</ParamField>
+
+**Returns:** A `RopChain` that performs the register moves.
+
+**Raises:** `RopException` if moves cannot be performed.
+
+### verify
+
+```python
+verify(chain, preserve_regs, registers) -> bool
+```
+
+Verifies that a chain correctly moves registers.
+
+<ParamField path="chain" type="RopChain" required>
+  The chain to verify.
+</ParamField>
+
+<ParamField path="preserve_regs" type="set" required>
+  Registers that should not be modified.
+</ParamField>
+
+<ParamField path="registers" type="dict" required>
+  Target register moves.
+</ParamField>
+
+**Returns:** True if verification passes, False otherwise.
+
+## ROP Instance Method
+
+When you call `rop.move_regs()`, it invokes `RegMover.run()` internally:
+
+```python
+rop.move_regs(**moves, preserve_regs=None)
+```
+
+## Implementation Details
+
+### Move Graph
+
+RegMover builds a directed graph where:
+- **Nodes** = Registers
+- **Edges** = Move gadgets with metadata (bits, blocks)
+
+From source code (reg_mover.py:345-361):
+
+```python
+graph = nx.DiGraph()
+graph.add_nodes_from(arch.reg_list)
+
+# Add edges for each move gadget
+for block in reg_moving_blocks:
+    for move in block.reg_moves:
+        edge = (move.from_reg, move.to_reg)
+        graph.add_edge(edge[0], edge[1], 
+                      block=[block], 
+                      bits=move.bits)
+```
+
+### Path Finding
+
+Uses NetworkX to find shortest paths between registers:
+
+```python
+paths = nx.all_shortest_paths(graph, 
+                             source=move.from_reg, 
+                             target=move.to_reg)
+```
+
+### Gadget Types
+
+RegMover recognizes several move gadget patterns:
+
+1. **Direct moves**: `mov rax, rdx; ret`
+2. **Exchange**: `xchg rax, rbx; ret`
+3. **Conditional moves**: `cmov rax, rdx; ret` (if enabled)
+4. **Arithmetic**: `lea rax, [rdx]; ret`
+
+## PushPopMover Component
+
+A specialized component that constructs moves via push/pop chains.
+
+### How It Works
+
+```python
+# To move rax to rdi:
+push rax; ret    # Push source onto stack
+pop rdi; ret     # Pop into destination
+```
+
+From source code (reg_mover.py:64-173):
+
+```python
+class PushPopMover(Builder):
+    """Construct register moves by chaining push/pop"""
+    
+    def _optimize_todos(self):
+        # Only use push/pop if no direct move exists
+        for from_reg, to_reg in product(arch.reg_list, arch.reg_list):
+            if not graph.has_edge(from_reg, to_reg):
+                # Find matching push/pop pair
+                push_gadgets = stack_write_dict[from_reg]
+                pop_gadgets = reg_setting_dict[to_reg]
+                # Try to chain them
+```
+
+## Usage Examples
+
+### Basic Register Move
+
+```python
+import angr
+import angrop
+
+proj = angr.Project("/bin/bash")
+rop = proj.analyses.ROP()
+rop.find_gadgets()
+
+# Move rdx to rax
+chain = rop.move_regs(rax='rdx')
+chain.pp()
+```
+
+Output:
+```
+0x000000000004a1dd: mov rax, rdx; ret
+```
+
+### Moving Multiple Registers
+
+```python
+# Move multiple registers in one chain
+chain = rop.move_regs(
+    rax='rdx',
+    rbx='rcx'
+)
+```
+
+### Using Return Values
+
+```python
+# Call function that returns a value in rax
+chain = rop.func_call("find_task_by_vpid", [1])
+
+# Move return value from rax to rdi for next call
+chain += rop.move_regs(rdi='rax')
+
+# Use the value as an argument
+chain += rop.func_call("some_function", [], preserve_regs={'rdi'})
+```
+
+### Preserving Registers During Moves
+
+```python
+# Move without clobbering other registers
+chain = rop.move_regs(rax='rdx', preserve_regs={'rbx', 'rcx'})
+```
+
+### Chained Moves
+
+If no direct move exists, RegMover chains multiple moves:
+
+```python
+# No direct r15 -> r8 move exists
+chain = rop.move_regs(r8='r15')
+
+# RegMover might chain:
+# mov rax, r15; ret
+# mov r8, rax; ret
+```
+
+### Complex Move Sequences
+
+From kernel ROP example:
+
+```python
+# Step 1: Call function, result in rax
+chain = rop.func_call("find_task_by_vpid", [1])
+
+# Step 2: Move result to rdi
+chain += rop.move_regs(rdi='rax')
+
+# Step 3: Set second argument
+chain += rop.set_regs(rsi=init_nsproxy, preserve_regs={'rdi'})
+
+# Step 4: Call with both arguments
+chain += rop.func_call("switch_task_namespaces", [], 
+                       preserve_regs={'rdi', 'rsi'})
+```
+
+## Optimization
+
+RegMover includes optimization to normalize complex gadgets:
+
+### Normalizing Non-Self-Contained Gadgets
+
+From source code (reg_mover.py:211-258):
+
+```python
+def build_normalize_todos(self):
+    """Identify gadgets that can improve the move graph"""
+    for gadget in reg_moving_gadgets:
+        if gadget.self_contained:
+            continue
+        
+        # Check for new moves:
+        # 1. Edge doesn't exist
+        # 2. Moves more bits than existing
+        for m in gadget.reg_moves:
+            edge = (m.from_reg, m.to_reg)
+            if not graph.has_edge(*edge):
+                new_moves.append(m)
+            elif m.bits > edge_data['bits']:
+                new_moves.append(m)
+```
+
+## Move Graph Metadata
+
+Each edge in the move graph contains:
+
+- **block**: List of gadgets sorted by stack_change
+- **bits**: Maximum bits moved (8, 16, 32, or 64)
+
+Example:
+```python
+edge_data = {
+    'block': [gadget1, gadget2, ...],  # Sorted by efficiency
+    'bits': 64  # Full register width
+}
+```
+
+## Architecture-Specific Behavior
+
+### x86_64
+
+Full support for all GPRs and common move patterns.
+
+```python
+# Common x64 moves
+chain = rop.move_regs(
+    rax='rdi',  # mov rax, rdi; ret
+    rbx='rsi',  # mov rbx, rsi; ret
+    rcx='rdx'   # mov rcx, rdx; ret
+)
+```
+
+### ARM
+
+Supports ARM register moves:
+
+```python
+chain = rop.move_regs(
+    r0='r1',  # mov r0, r1; ret
+    r2='r3'   # mov r2, r3; ret
+)
+```
+
+### Partial Register Moves
+
+RegMover tracks bit width of moves:
+
+```python
+# 32-bit move (eax from edx)
+mov eax, edx; ret  # bits=32
+
+# 64-bit move (rax from rdx)  
+mov rax, rdx; ret  # bits=64
+```
+
+## Error Handling
+
+### "Couldn't move registers :("
+
+Raised when no valid move chain can be found.
+
+**Solutions:**
+1. Run `find_gadgets(optimize=True)` to enable push/pop moves
+2. Use intermediate register: `rax='src'` then `dst='rax'`
+3. Check if registers are valid for your architecture
+
+### "There is no chain can move X to Y"
+
+Raised when no path exists in the move graph.
+
+**Solutions:**
+1. Try an intermediate register as a bridge
+2. Use `set_regs()` instead if the value is known
+3. Check if both registers are available on your architecture
+
+## Performance Considerations
+
+- Move graph is built once during bootstrap
+- Only shortest paths are considered to limit complexity
+- Edge blocks are sorted by stack_change for efficiency
+- Multiprocessing used during optimization
+
+## Verification
+
+RegMover verifies that moves are correct:
+
+From source code (reg_mover.py:363-395):
+
+```python
+def verify(self, chain, preserve_regs, registers):
+    state = chain.exec()
+    
+    for reg, val in registers.items():
+        bv = getattr(state.regs, reg)
+        # Check that destination contains source value
+        if val.reg_name not in bv._encoded_name.decode():
+            return False
+    
+    # Check preserved registers weren't touched
+    for act in state.history.actions:
+        if act.type == 'reg' and act.action == 'write':
+            reg_name = arch.translate_register_name(act.offset)
+            if reg_name in preserve_regs:
+                return False
+    
+    return True
+```
+
+## Best Practices
+
+1. **Prefer direct moves** - Let RegMover find the shortest path
+2. **Chain efficiently** - Combine multiple moves in one call
+3. **Use preserve_regs** - Protect values you need to keep
+4. **Verify chains** - Use `chain.pp()` to inspect generated gadgets
+
+## See Also
+
+- [RegSetter](/api/reg-setter) - Setting registers to values
+- [Register Operations Guide](/guides/register-operations) - Usage examples
+- [ChainBuilder](/api/chain-builder) - Main chain building interface

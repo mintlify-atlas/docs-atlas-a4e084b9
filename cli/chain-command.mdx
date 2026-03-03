@@ -1,0 +1,106 @@
+---
+title: chain Command
+description: Build ROP chains for specific targets
+---
+
+## Overview
+
+The `chain` command automatically builds ROP chains to achieve specific goals like spawning a shell or calling functions with controlled arguments.
+
+## Usage
+
+```bash
+angrop-cli chain [options] <path>
+```
+
+### Arguments
+
+- `path` - Path to the binary to analyze
+
+### Options
+
+- `-t, --target` - Target goal for the ROP chain (required)
+- `-f, --fast` - Skip optimization for faster chain generation
+
+## Target Goals
+
+The `-t/--target` option specifies what the ROP chain should accomplish:
+
+### `execve`
+
+Generate a ROP chain that calls `execve("/bin/sh", 0, 0)` to spawn a shell.
+
+- Looks for `execve` in PLT or symbols
+- Searches for `/bin/sh` string in the binary
+- If `/bin/sh` is not found, writes it to writable memory first
+
+```bash
+angrop-cli chain -t execve /bin/bash
+```
+
+### `system`
+
+Generate a ROP chain that calls `system("sh")` to spawn a shell.
+
+- Requires the binary to have a `system` function in PLT or symbols
+- Searches for `sh` string in the binary
+
+```bash
+angrop-cli chain -t system /bin/bash
+```
+
+### `arg1`, `arg2`, `arg3`, `arg4`
+
+Generate a ROP chain to call a function at address `0xdeadbeef` with 1, 2, 3, or 4 arguments set to `0x41414141`.
+
+Useful for testing argument-passing gadgets or calling specific functions.
+
+```bash
+angrop-cli chain -t arg2 /bin/ls
+```
+
+## Fast Mode
+
+By default, the chain command optimizes gadgets after finding them, which can take time. Use the `-f/--fast` flag to skip optimization:
+
+```bash
+angrop-cli chain -t execve -f /bin/bash
+```
+
+This generates chains faster but they may be longer or less reliable.
+
+## Output Format
+
+The command outputs Python code using pwntools-style syntax:
+
+```python
+code_base = 0x0
+chain = b""
+chain += p64(code_base + 0x36083)  # pop rax; pop rbx; pop rbp; ret 
+chain += p64(code_base + 0x30016)  # add rsp, 8; ret 
+...
+```
+
+You can copy this code directly into your exploit scripts.
+
+## Example: execve Chain
+
+```bash
+$ angrop-cli chain -t execve /bin/bash
+code_base = 0x0
+chain = b""
+chain += p64(code_base + 0x36083)	# pop rax; pop rbx; pop rbp; ret 
+chain += p64(code_base + 0x30016)	# add rsp, 8; ret 
+chain += p64(code_base + 0x34873)
+chain += p64(code_base + 0x0)
+chain += p64(code_base + 0x9616d)	# mov edx, ebp; mov rsi, r12; mov rdi, rbx; call rax
+chain += p64(code_base + 0xe501e)	# pop rsi; ret 0
+chain += p64(code_base + 0x0)
+chain += p64(code_base + 0x31470)	# execve@plt
+chain += p64(0x0)
+chain += p64(code_base + 0x10d5bf)
+```
+
+## Performance
+
+Like the dump command, chain uses cached gadgets from `/tmp` to speed up subsequent runs on the same binary. Optimization (when not using `-f`) runs in parallel using all available CPU cores.

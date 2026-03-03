@@ -1,0 +1,126 @@
+---
+title: 'Simple Register Chain'
+description: 'Learn how to build basic ROP chains that set register values'
+---
+
+## Overview
+
+This example demonstrates how to build a simple ROP chain that sets register values using `set_regs()`. This is one of the most fundamental operations in ROP chain construction.
+
+## Basic Register Setting
+
+<Steps>
+  <Step title="Initialize angrop">
+    Load your binary and create a ROP analysis object:
+
+    ```python
+    import angr
+    import angrop
+
+    # Load the binary
+    p = angr.Project("/bin/ls")
+    
+    # Create ROP analysis
+    rop = p.analyses.ROP()
+    ```
+  </Step>
+
+  <Step title="Find gadgets">
+    Search for ROP gadgets in the binary:
+
+    ```python
+    # Find all available gadgets
+    rop.find_gadgets()
+    ```
+
+    This analyzes the binary and identifies useful ROP gadgets that can be chained together.
+  </Step>
+
+  <Step title="Build the chain">
+    Create a chain that sets specific register values:
+
+    ```python
+    # Set rax to 0x41414141 and rbx to 0x42424242
+    chain = rop.set_regs(rax=0x41414141, rbx=0x42424242)
+    ```
+  </Step>
+
+  <Step title="Print the payload">
+    Generate exploit code ready to copy into your script:
+
+    ```python
+    chain.print_payload_code()
+    ```
+  </Step>
+</Steps>
+
+## Complete Example
+
+```python
+import angr
+import angrop
+
+# Load the binary
+p = angr.Project("/bin/ls")
+
+# Create ROP analysis
+rop = p.analyses.ROP()
+
+# Find gadgets
+rop.find_gadgets()
+
+# Build chain to set registers
+chain = rop.set_regs(rax=0x41414141, rbx=0x42424242)
+
+# Print the payload code
+chain.print_payload_code()
+```
+
+## Expected Output
+
+```python
+code_base = 0x0
+chain = b""
+chain += p64(code_base + 0xf5e2)   # pop rbx; pop r12; test eax, eax; pop rbp; cmovs eax, edx; ret 
+chain += p64(0x42424242)
+chain += p64(0x0)
+chain += p64(0x0)
+chain += p64(code_base + 0x812f)   # pop rsi; pop rbp; ret 
+chain += p64(0x41414141)
+chain += p64(0x0)
+chain += p64(code_base + 0x169dd)  # mov rax, rsi; ret 
+chain += p64(code_base + 0x10a55)
+```
+
+## Understanding the Chain
+
+1. **First gadget** (`0xf5e2`): Pops values into `rbx`, `r12`, and `rbp`. We use this to set `rbx` to `0x42424242`.
+
+2. **Second gadget** (`0x812f`): Pops a value into `rsi`. We use this to temporarily store `0x41414141` in `rsi`.
+
+3. **Third gadget** (`0x169dd`): Moves the value from `rsi` into `rax`, achieving our goal of setting `rax` to `0x41414141`.
+
+## Debugging Chains
+
+You can also pretty-print the chain for debugging:
+
+```python
+chain.pp()
+```
+
+This shows each gadget and its arguments in a readable format.
+
+## Setting Multiple Registers
+
+You can set as many registers as needed in a single call:
+
+```python
+chain = rop.set_regs(
+    rax=0x1337,
+    rbx=0x56565656,
+    rcx=0xdeadbeef,
+    rdx=0xcafebabe
+)
+```
+
+angrop automatically finds the optimal gadget sequence to set all requested registers.
