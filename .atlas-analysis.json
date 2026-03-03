@@ -1,0 +1,149 @@
+{
+  "projectType": "sdk-library",
+  "projectName": "angrop",
+  "projectDescription": "A ROP gadget finder and chain builder built on top of angr's symbolic execution engine",
+  "theme": "aspen",
+  "primaryColor": "#DC143C",
+  "lightColor": "#FF6B6B",
+  "darkColor": "#8B0000",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Getting Started",
+            "pages": [
+              "introduction",
+              "installation",
+              "quickstart"
+            ]
+          },
+          {
+            "group": "Core Concepts",
+            "pages": [
+              "concepts/gadgets",
+              "concepts/chain-building",
+              "concepts/symbolic-execution",
+              "concepts/architectures"
+            ]
+          },
+          {
+            "group": "Guides",
+            "pages": [
+              "guides/finding-gadgets",
+              "guides/building-chains",
+              "guides/register-operations",
+              "guides/memory-operations",
+              "guides/function-calls",
+              "guides/syscalls",
+              "guides/kernel-rop",
+              "guides/badbytes",
+              "guides/optimization"
+            ]
+          },
+          {
+            "group": "CLI Tool",
+            "pages": [
+              "cli/overview",
+              "cli/dump-command",
+              "cli/chain-command"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "Core Classes",
+            "pages": [
+              "api/rop",
+              "api/chain-builder",
+              "api/rop-chain",
+              "api/rop-gadget"
+            ]
+          },
+          {
+            "group": "Chain Builders",
+            "pages": [
+              "api/reg-setter",
+              "api/reg-mover",
+              "api/mem-writer",
+              "api/mem-changer",
+              "api/func-caller",
+              "api/sys-caller",
+              "api/sigreturn",
+              "api/pivot",
+              "api/shifter"
+            ]
+          },
+          {
+            "group": "Advanced",
+            "pages": [
+              "api/gadget-finder",
+              "api/configuration",
+              "api/utilities"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Examples",
+        "groups": [
+          {
+            "group": "Basic Examples",
+            "pages": [
+              "examples/simple-chain",
+              "examples/execve-chain",
+              "examples/register-control"
+            ]
+          },
+          {
+            "group": "Advanced Examples",
+            "pages": [
+              "examples/kernel-escape",
+              "examples/custom-gadgets",
+              "examples/complex-chains"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Automatic ROP gadget discovery using symbolic execution",
+    "Intelligent chain generation with constraint solving",
+    "Multi-architecture support (x86/x64, ARM, AArch64, MIPS, RISC-V)",
+    "Kernel-mode ROP chain building",
+    "Advanced operations: register setting, memory manipulation, syscalls, function calls",
+    "Badbyte filtering and optimization",
+    "CLI tool for quick gadget finding and chain generation",
+    "Built on angr's powerful binary analysis framework"
+  ],
+  "publicApiSurface": [
+    "project.analyses.ROP()",
+    "rop.find_gadgets()",
+    "rop.find_gadgets_single_threaded()",
+    "rop.set_regs()",
+    "rop.move_regs()",
+    "rop.write_to_mem()",
+    "rop.mem_add()",
+    "rop.mem_xor()",
+    "rop.mem_or()",
+    "rop.mem_and()",
+    "rop.func_call()",
+    "rop.do_syscall()",
+    "rop.execve()",
+    "rop.sigreturn()",
+    "rop.sigreturn_syscall()",
+    "rop.pivot()",
+    "rop.shift()",
+    "rop.retsled()",
+    "rop.set_badbytes()",
+    "rop.save_gadgets()",
+    "rop.load_gadgets()",
+    "angrop-cli dump",
+    "angrop-cli chain"
+  ]
+}
